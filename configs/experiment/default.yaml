@@ -1,0 +1,4 @@
+# @package _global_
+# Experiment-specific overrides go here (e.g. configs/experiment/sweep_run_01.yaml).
+# Empty by default — override any base_config.yaml key via Hydra's config group syntax:
+#   python scripts/train.py +experiment=sweep_run_01

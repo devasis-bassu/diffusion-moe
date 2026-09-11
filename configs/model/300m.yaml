@@ -1,0 +1,10 @@
+# @package model
+d_model: 1024
+n_heads: 16
+n_layers: 24
+ffn_dim: 4096
+max_seq_len: 2048
+vocab_size: 32000
+rope_base: 10000
+norm_eps: 1.0e-5
+router: "diffusion" # diffusion | cosine | switch | random (dense baseline: layers_to_replace: [])

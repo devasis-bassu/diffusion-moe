@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Environment variables
+.env
+
+# Weights & Biases
+wandb/
+
+# Checkpoints and large artifacts
+checkpoints/
+*.ckpt
+*.pt
+*.safetensors
+results/**/*.png
+results/**/*.json
+results/**/*.pkl
+!results/**/.gitkeep
+
+# Data / HF cache (DATA_DIR target — datasets, xet cache, logs)
+data/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store

@@ -1,0 +1,19 @@
+# Training/eval boxes are provisioned on vast.ai (Linux + CUDA 12.1).
+# torch's +cu121 build isn't on PyPI proper — resolve it with:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# This pin will NOT resolve on macOS/Apple Silicon (no cu121 wheel for that platform);
+# local dev on this machine is for scaffolding/linting only, not for running torch.
+torch==2.3.0+cu121
+transformers==4.40.0
+datasets==2.19.0
+numpy
+scipy
+scikit-learn
+matplotlib
+wandb
+pytest
+tqdm
+hydra-core
+lm-eval
+accelerate
+python-dotenv

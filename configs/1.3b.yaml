@@ -1,0 +1,7 @@
+# Top-level entry point for the 1.3B model size — usable with
+# `python scripts/train.py --config-name=1.3b`. Composes base_config.yaml but
+# overrides the model group to configs/model/1.3b.yaml.
+defaults:
+  - base_config
+  - override /model: 1.3b
+  - _self_

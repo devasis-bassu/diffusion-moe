@@ -1,0 +1,7 @@
+# Top-level entry point for the 300M model size — usable with
+# `python scripts/train.py --config-name=300m`. base_config.yaml already
+# defaults to the 300m model group, so this just re-exposes it as its own
+# --config-name target (see also configs/1.3b.yaml).
+defaults:
+  - base_config
+  - _self_
