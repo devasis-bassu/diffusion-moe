@@ -143,3 +143,29 @@ def test_no_expert_left_without_gradient_when_all_are_used():
 
     for expert in layer.experts:
         assert expert.gate_proj.weight.grad is not None
+
+
+def test_forward_and_backward_work_under_real_bf16_mixed_precision():
+    """Reproduces a real crash found by actually running a training step
+    through Trainer with the project's own default precision (bf16): NumPy
+    has no bfloat16 dtype at all, so any unguarded `.numpy()` call on a bf16
+    tensor raises outright (not a precision/accuracy issue -- a hard crash),
+    and torch.cdist has no bfloat16 implementation either. Neither training-
+    free diagnostic nor the pilot (whose PilotMoEBlock/DtypeCastWrapper
+    already forced fp32 for unrelated reasons) could have caught this --
+    only running the production DiffusionMoELayer under real mixed precision
+    did. Covers both fixed call sites: _compute_diffusion_coords's z.numpy()
+    and landmark_scale/centroid_separation_loss's torch.cdist (exercised via
+    ExpertCentroids.initialise_from_batch and this layer's own forward).
+    """
+    layer = _make_layer().to(torch.bfloat16)
+    x = torch.randn(BATCH, SEQ_LEN, D_MODEL, dtype=torch.bfloat16)
+    positions = torch.arange(SEQ_LEN).unsqueeze(0).expand(BATCH, -1)
+    layer.train()
+
+    out, _ = layer(x, positions)
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+
+    out.float().sum().backward()
+    assert layer.centroids.centroids.grad is not None

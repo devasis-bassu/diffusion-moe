@@ -11,6 +11,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 
 from diffusion_moe.data.dataset import IGNORE_INDEX
+from diffusion_moe.routing.separation import landmark_scale
 from diffusion_moe.training.losses import total_loss
 from diffusion_moe.utils.device import (
     all_reduce_mean,
@@ -88,6 +89,16 @@ class Trainer:
         self.precision = _get(training_cfg, "precision", "bf16")
         self.mu = _get(routing_cfg, "mu_load", 0.01)
         self.nu = _get(routing_cfg, "nu_sep", 0.05)
+        # centroid_separation_loss's gradient has no upper bound on how far it
+        # pushes expert centroids apart (by design -- see test_separation.py);
+        # a real pilot run showed this diverge ~4 orders of magnitude over 300
+        # steps once nothing was capping it, collapsing the router toward
+        # uniform dispatch (see reports/phase1_findings_report.md §3.4, bug 1).
+        # The pilot script itself applies ExpertCentroids.clip_norm_() after
+        # every optimizer step as the fix -- this mirrors that here, in the
+        # actual production training loop, since the pilot's own bespoke loop
+        # was the only caller and this Trainer never inherited the safeguard.
+        self.centroid_max_radius_factor = _get(routing_cfg, "centroid_max_radius_factor", 3.0)
 
         self.amp_enabled = self.precision in ("bf16", "fp16")
         self.amp_dtype = _AMP_DTYPES.get(self.precision, torch.float32)
@@ -139,6 +150,27 @@ class Trainer:
             logits, _, router_outputs = self.model(input_ids)
             return total_loss(logits, labels, router_outputs, self.mu, self.nu)
 
+    def _clip_centroid_norms(self) -> None:
+        """Caps each DiffusionMoELayer's expert centroids at a multiple of
+        that layer's own current landmark_scale, after every optimizer step
+        -- see the note on centroid_max_radius_factor in __init__. Only
+        DiffusionMoELayer blocks have both `centroids` and `ndm` (the cosine/
+        switch/random router variants and plain dense TransformerBlocks
+        don't), and ndm.psi_landmarks_ is None until the first forward pass
+        has fit it, which has always already happened by the time this is
+        called (train_step always does a forward pass before optimizer.step()).
+        """
+        for block in self.raw_model.blocks:
+            centroids = getattr(block, "centroids", None)
+            ndm = getattr(block, "ndm", None)
+            if centroids is None or ndm is None or ndm.psi_landmarks_ is None:
+                continue
+            psi_landmarks = torch.from_numpy(ndm.psi_landmarks_).to(
+                dtype=centroids.centroids.dtype, device=centroids.centroids.device
+            )
+            scale = landmark_scale(psi_landmarks)
+            centroids.clip_norm_(max_norm=self.centroid_max_radius_factor * scale)
+
     def train_step(self, micro_batches: list[dict[str, torch.Tensor]]) -> dict[str, float]:
         """One optimizer step, gradient-accumulated over `micro_batches`."""
         self.optimizer.zero_grad(set_to_none=True)
@@ -168,6 +200,7 @@ class Trainer:
         else:
             self.optimizer.step()
 
+        self._clip_centroid_norms()
         self.scheduler.step()
         self.step += 1
 

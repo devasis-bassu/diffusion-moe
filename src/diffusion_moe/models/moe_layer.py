@@ -85,7 +85,14 @@ class DiffusionMoELayer(nn.Module):
         model's device/dtype.
         """
         batch, seq_len, d_model = z.shape
-        z_flat = z.detach().reshape(-1, d_model).cpu().numpy()
+        # .float() before .numpy(): NumPy has no bfloat16 dtype, so this
+        # crashes outright under real bf16 mixed-precision training (the
+        # project's own default precision) without it -- found by actually
+        # running a real step through Trainer, not caught by any prior
+        # training-free diagnostic or by the pilot (whose separate
+        # DtypeCastWrapper/PilotMoEBlock already cast to fp32 for other
+        # reasons, incidentally avoiding this exact crash).
+        z_flat = z.detach().reshape(-1, d_model).float().cpu().numpy()
 
         should_refresh = int(self._step.item()) % self.centroid_refresh_steps == 0
         if should_refresh:

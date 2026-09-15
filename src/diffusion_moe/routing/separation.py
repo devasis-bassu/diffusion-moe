@@ -34,7 +34,13 @@ def landmark_scale(Psi_landmarks: torch.Tensor) -> torch.Tensor:
     rescaling actually happens and defeating the fix it's used for.
     """
     n_landmarks = Psi_landmarks.shape[0]
-    landmark_dists = torch.cdist(Psi_landmarks, Psi_landmarks, p=2)
+    # torch.cdist has no bfloat16 implementation at all (raises
+    # NotImplementedError outright, not just a precision concern) -- real
+    # callers (DiffusionMoELayer/PilotMoEBlock under bf16 mixed-precision
+    # training) pass bf16 tensors here, found by actually running a real
+    # training step. .float() is differentiable, so this doesn't affect
+    # gradient flow back to Psi_landmarks/centroids in bf16.
+    landmark_dists = torch.cdist(Psi_landmarks.float(), Psi_landmarks.float(), p=2)
     landmark_mask = ~torch.eye(n_landmarks, dtype=torch.bool, device=Psi_landmarks.device)
     return landmark_dists[landmark_mask].mean() + 1e-30
 
@@ -53,7 +59,8 @@ def centroid_separation_loss(centroids: torch.Tensor, Psi_landmarks: torch.Tenso
     instead of growing unboundedly with raw centroid distance.
     """
     n_experts = centroids.shape[0]
-    centroid_dists = torch.cdist(centroids, centroids, p=2)
+    # Same bf16 cdist limitation as landmark_scale above.
+    centroid_dists = torch.cdist(centroids.float(), centroids.float(), p=2)
     centroid_mask = ~torch.eye(n_experts, dtype=torch.bool, device=centroids.device)
     mean_centroid_dist = centroid_dists[centroid_mask].mean()
 

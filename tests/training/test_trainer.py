@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from diffusion_moe.data.dataset import IGNORE_INDEX
 from diffusion_moe.models.moe_model import DiffusionMoETransformer
+from diffusion_moe.routing.separation import landmark_scale
 from diffusion_moe.training import trainer as trainer_module
 from diffusion_moe.training.optimizer import build_optimizer, build_scheduler
 from diffusion_moe.training.trainer import Trainer
@@ -203,6 +204,68 @@ def test_moe_layer_produces_nonzero_aux_losses(tmp_path):
     t = _make_trainer(tmp_path, layers_to_replace=[0])
     metrics = t.train_step([next(iter(t.train_loader))])
     assert metrics["load_loss"] != 0.0 or metrics["sep_loss"] != 0.0
+
+
+def test_train_step_clips_centroid_norms_after_optimizer_step(tmp_path):
+    """The actual gap this closes: ExpertCentroids.clip_norm_() existed but
+    was only ever called by scripts/pilot_finetune.py's own bespoke training
+    loop -- the production Trainer never called it at all, so real training
+    through Trainer/DiffusionMoETransformer (unlike the pilot) had no
+    protection against centroid_separation_loss's unbounded-growth gradient
+    (see reports/phase1_findings_report.md §3.4, bug 1; recommendation 4
+    flagged this fix as unverified in the production path). Reproducing the
+    full multi-hundred-step organic blowup through Adam-optimized training on
+    tiny synthetic data isn't practical (gradient clipping already bounds
+    single-step movement, and the existing test_clip_norm_prevents_the_
+    runaway_growth_a_real_pilot_run_hit in test_centroids.py already proves
+    clip_norm_ itself works) -- this instead directly tests the wiring gap:
+    a deliberately-inflated centroid must come back down within bounds after
+    one real train_step.
+    """
+    t = _make_trainer(tmp_path, layers_to_replace=[0])
+    # One real step first, so ndm.psi_landmarks_ is populated (fit during the
+    # forward pass) before we inflate anything.
+    t.train_step([next(iter(t.train_loader))])
+
+    block = t.model.blocks[0]
+    scale = landmark_scale(
+        torch.from_numpy(block.ndm.psi_landmarks_).to(block.centroids.centroids.dtype)
+    )
+    with torch.no_grad():
+        block.centroids.centroids[0] = torch.full_like(block.centroids.centroids[0], 1000.0)
+    assert block.centroids.centroids.norm(dim=-1).max() > 50 * scale  # sanity: really is huge
+
+    t.train_step([next(iter(t.train_loader))])
+
+    assert block.centroids.centroids.norm(dim=-1).max() <= t.centroid_max_radius_factor * scale * 1.5
+
+
+def test_dense_model_train_step_does_not_error_without_centroids(tmp_path):
+    """_clip_centroid_norms must be a safe no-op for dense TransformerBlocks
+    (no `centroids`/`ndm` attributes at all) and for the non-diffusion router
+    variants -- it shouldn't assume every block is a DiffusionMoELayer."""
+    t = _make_trainer(tmp_path, layers_to_replace=[])
+    t.train_step([next(iter(t.train_loader))])  # must not raise
+
+
+def test_centroid_max_radius_factor_read_from_routing_config(tmp_path):
+    t = _make_trainer(
+        tmp_path,
+        layers_to_replace=[0],
+        training_overrides=None,
+    )
+    t.config["routing"]["centroid_max_radius_factor"] = 7.5
+    t2 = Trainer(
+        t.model,
+        t.optimizer,
+        t.scheduler,
+        t.train_loader,
+        t.val_loader,
+        t.config,
+        device="cpu",
+        checkpoint_dir=str(tmp_path / "checkpoints2"),
+    )
+    assert t2.centroid_max_radius_factor == 7.5
 
 
 def test_grad_clipping_bounds_gradient_norm(tmp_path):

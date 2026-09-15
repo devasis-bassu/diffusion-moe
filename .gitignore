@@ -30,6 +30,9 @@ wandb/
 
 # Checkpoints and large artifacts
 checkpoints/
+
+# Hydra's automatic per-run output directory (scripts/train.py etc.)
+/outputs/
 *.ckpt
 *.pt
 *.safetensors

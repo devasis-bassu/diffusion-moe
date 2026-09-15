@@ -37,7 +37,12 @@ class ExpertCentroids(nn.Module):
         if self.is_initialised:
             return
 
-        flat = Psi_t.detach().reshape(-1, self.n_components).cpu().numpy()
+        # .float() before .numpy(): NumPy has no bfloat16 dtype, so this
+        # crashes outright under real bf16 mixed-precision training without
+        # it -- the same bug found and fixed in DiffusionMoELayer's own
+        # numpy conversion, hit here too since Psi_t arrives in the model's
+        # compute dtype.
+        flat = Psi_t.detach().reshape(-1, self.n_components).float().cpu().numpy()
         n_seeds = min(self.n_experts, flat.shape[0])
 
         centers, _ = kmeans_plusplus(

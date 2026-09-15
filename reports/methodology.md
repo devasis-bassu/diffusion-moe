@@ -207,7 +207,7 @@ Both bugs live in `src/diffusion_moe/routing/` — shared code the production `D
 
 **Assumption this revises**: `configs/base_config.yaml`'s `tau: 0.1` implicitly assumed router logits are O(1) scale. They aren't — real diffusion coordinates are many orders of magnitude smaller, layer- and model-dependent. Anywhere `tau` is used against raw (non-rescaled) diffusion coordinates going forward should be treated as suspect.
 
-**Not yet done**: neither fix has been exercised through the production `Trainer`/`DiffusionMoETransformer` path, only via the pilot's frozen-backbone splice — see findings report recommendation 4.
+**Done — see §4.7**: both fixes confirmed holding through the production `Trainer`/`DiffusionMoETransformer` path, not just the pilot's frozen-backbone splice — findings report recommendation 4, §3.6.
 
 ### 4.5 Tuning attempts against the load-balance oscillation
 
@@ -235,3 +235,24 @@ Full narrative and results table in findings report §3.5; methodology/tooling n
 **Infrastructure note — a repeat CDN-flakiness problem, and the actual fix**: getting these runs to execute at all required resolving a real, recurring reliability issue. HuggingFace Hub's *streaming* dataset reader (`datasets.load_dataset(..., streaming=True)`, used throughout this project via `StreamingTextDataset`) stalled indefinitely three separate times fetching wikitext — traced with debug logging to HF's newer "Xet" CDN backend, which redirects file reads through many small, separately-connected byte-range requests rather than one bulk transfer. Pre-fetching the files with `huggingface_hub.hf_hub_download` (a more robust, resumable downloader) and even rsync-ing the resulting local cache to the training box did **not** fix this — confirmed directly via debug logging that streaming reads go through `fsspec`'s `HfFileSystem`, a different code path that re-fetches over the network regardless of what's already in the local hub cache. The fix that actually worked: a new `local_data_files` parameter on `StreamingTextDataset` (`src/diffusion_moe/data/dataset.py`) that, when given local parquet file paths, calls `load_dataset("parquet", data_files=..., streaming=True)` instead of the registry's Hub repo id — bypassing network reads entirely. Exposed as `--local_data_files` on `pilot_finetune.py`. Tested both for call-argument wiring and end-to-end against a real local parquet fixture (`tests/data/test_dataset.py`).
 
 **Separately, a real repo-integrity bug was found and fixed while investigating this**: `.gitignore`'s `data/` pattern was unanchored, matching not just the intended top-level `DATA_DIR` cache target but also `src/diffusion_moe/data/` (the actual Python package: `dataset.py`, `tokenizer.py`, `dataloader.py`) and `tests/data/` — meaning this whole package had never been tracked by git, since the initial commit. Fixed by anchoring to `/data/`; the same bug class as an earlier `rsync --exclude='data'` mistake (§4.1), same fix.
+
+### 4.7 Verified in the actual production training path — and three more bugs found
+
+Full narrative in findings report §3.6. Every result above this point was exercised only through `PilotMoEBlock`'s splice into a frozen pretrained model, never through the project's real training entrypoint. Closing that gap (findings report recommendation 4) meant running `scripts/train.py` directly:
+
+```bash
+WANDB_API_KEY= python scripts/train.py \
+    model.d_model=128 model.n_heads=2 model.n_layers=2 model.ffn_dim=256 model.max_seq_len=64 \
+    routing.n_experts=4 routing.top_k=2 routing.n_components=8 routing.n_landmarks=16 routing.centroid_refresh_steps=5 \
+    data.dataset=wikitext data.batch_size=2 data.max_seq_len=64 data.num_workers=0 data.val_tokens=256 \
+    training.total_tokens=1024 training.grad_accum_steps=1 training.warmup_steps=0 \
+    training.checkpoint_steps=1000000 training.eval_steps=1000000 training.log_steps=1
+```
+
+A tiny model (for speed, not to avoid anything) at real defaults otherwise — critically, `training.precision: bf16`, the project's own actual default, not fp32.
+
+**It crashed immediately**, on `TypeError: Got unsupported ScalarType BFloat16` inside `DiffusionMoELayer._compute_diffusion_coords`'s `.cpu().numpy()` call, then again at the identical line in `ExpertCentroids.initialise_from_batch`, then again inside `landmark_scale`'s `torch.cdist` call. Root cause in all three: NumPy has no `bfloat16` dtype, and `torch.cdist` has no `bfloat16` implementation — both are hard crashes, not accuracy concerns. `PilotMoEBlock` never hit this because its own `DtypeCastWrapper` already forces fp32 at the block boundary, for an unrelated reason (training stability of a small module bolted onto a frozen bf16 backbone) — which is exactly why the pilot's training-based validation couldn't have caught a bug specific to the production path's actual dtype handling.
+
+**Fixed**: `.float()` before `.numpy()` in `moe_layer.py` and `centroids.py`; `.float()` before `torch.cdist` in `separation.py` (both call sites — `landmark_scale` and `centroid_separation_loss`). All differentiable, no effect on gradient flow. Confirmed with a direct bf16 forward+backward test (`tests/models/test_moe_layer.py::test_forward_and_backward_work_under_real_bf16_mixed_precision`) and by rerunning the command above to completion: 8 clean steps, `load_loss`/`sep_loss` finite and non-degenerate throughout.
+
+**A fourth gap, unrelated to dtype**: `ExpertCentroids.clip_norm_()` (§4.4, bug 1's fix) was never called anywhere in `Trainer` — the pilot script's own training loop was its only caller in the entire codebase. Fixed by calling it from `Trainer.train_step()` after every optimizer step, for every block exposing both `centroids` and `ndm` attributes (`getattr`-guarded, so dense `TransformerBlock`s and the non-diffusion router variants are unaffected). `centroid_max_radius_factor` is now a `Trainer` config field (`routing.centroid_max_radius_factor`, default `3.0`, matching the pilot script's own default) rather than pilot-specific. Tested by deliberately inflating a centroid to 1000x its layer's scale mid-training and confirming one real `train_step` brings it back within bounds (`test_train_step_clips_centroid_norms_after_optimizer_step`) — the reproduction test in `test_centroids.py` already proves `clip_norm_` itself works; this one proves `Trainer` actually calls it.
