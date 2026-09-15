@@ -1,6 +1,9 @@
 """Tests for diffusion_eigenvectors."""
 
+from unittest.mock import patch
+
 import numpy as np
+from scipy.sparse.linalg import ArpackNoConvergence
 
 from diffusion_moe.geometry.eigensolver import diffusion_eigenvectors
 from diffusion_moe.geometry.kernel import gaussian_kernel
@@ -52,3 +55,26 @@ def test_dense_fallback_for_tiny_matrix():
     eigenvalues, eigenvectors = diffusion_eigenvectors(P, n_components=10)
     assert eigenvalues.shape[0] == 2
     assert eigenvectors.shape == (2, 2)
+
+
+def test_dense_fallback_when_arpack_fails_to_converge():
+    """Reproduces a real crash from a full 32-layer multiscale bandwidth
+    sweep: at some scales in the dyadic eps ladder, P's eigenspectrum becomes
+    near-degenerate/tightly clustered enough that ARPACK's iterative Lanczos
+    method (scipy.sparse.linalg.eigs) raises ArpackNoConvergence instead of
+    returning a result -- which previously crashed the whole sweep uncaught,
+    losing 7 of 32 layers' worth of real GPU compute. ARPACK failing here
+    isn't reproducible deterministically, so this mocks the failure directly
+    to confirm the dense fallback actually engages and still returns a
+    correctly-shaped, valid result.
+    """
+    P = _markov_matrix(n=50)
+    with patch(
+        "diffusion_moe.geometry.eigensolver.eigs",
+        side_effect=ArpackNoConvergence("no convergence", eigenvalues=[], eigenvectors=[]),
+    ):
+        eigenvalues, eigenvectors = diffusion_eigenvectors(P, n_components=10)
+
+    assert eigenvalues.shape == (10,)
+    assert eigenvectors.shape == (50, 10)
+    assert np.isclose(eigenvalues[0], 1.0, atol=1e-6)
