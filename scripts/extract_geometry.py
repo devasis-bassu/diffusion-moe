@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -34,10 +33,23 @@ from transformers import AutoModelForCausalLM
 
 from diffusion_moe.data.dataset import StreamingTextDataset, collate_fn
 from diffusion_moe.data.tokenizer import TokenizerWrapper
+from diffusion_moe.geometry.activation_capture import (
+    AttentionOutputCapture,
+    collect_layer_activations,
+    compute_tokens_per_batch,
+    subsample_valid_tokens,
+)
 from diffusion_moe.geometry.intrinsic_dim import estimate_intrinsic_dim, spectral_gap
 from diffusion_moe.geometry.nystrom import NystromDiffusionMap
 from diffusion_moe.utils.device import get_device
 from diffusion_moe.utils.env import load_env
+
+__all__ = [
+    "AttentionOutputCapture",
+    "collect_layer_activations",
+    "compute_tokens_per_batch",
+    "subsample_valid_tokens",
+]
 
 NYSTROM_M_VALUES = [32, 64, 128, 256]
 N_LANDMARKS = 128
@@ -70,146 +82,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="results/geometry")
     return parser.parse_args()
-
-
-class AttentionOutputCapture:
-    """Registers forward hooks on every decoder layer's self-attention
-    submodule to capture its raw output — the post-attention, pre-FFN-residual
-    point DiffusionMoELayer actually routes from. HF's own
-    `output_hidden_states` only exposes states at layer *boundaries* (after
-    the full attention+FFN block), one per layer, so it can't give us this
-    intermediate point; a hook on `.self_attn` is the only way to reach it.
-
-    Assumes a Llama/Mistral-family model (model.model.layers, each with a
-    .self_attn submodule) — true of both target models and most HF causal LMs
-    that share that code path.
-    """
-
-    def __init__(self, model: torch.nn.Module) -> None:
-        if not hasattr(model, "model") or not hasattr(model.model, "layers"):
-            raise ValueError(
-                "Expected a Llama/Mistral-family model exposing `model.model.layers` "
-                "(a ModuleList of decoder layers, each with a `.self_attn` submodule)."
-            )
-        self.layers = model.model.layers
-        self.outputs: list[torch.Tensor] = []
-        self._handles: list[Any] = []
-
-    def _hook(self, module: torch.nn.Module, inputs: Any, output: Any) -> None:
-        tensor = output[0] if isinstance(output, tuple) else output
-        self.outputs.append(tensor.detach())
-
-    def __enter__(self) -> "AttentionOutputCapture":
-        self.outputs = []
-        self._handles = [
-            layer.self_attn.register_forward_hook(self._hook) for layer in self.layers
-        ]
-        return self
-
-    def __exit__(self, *exc_info: Any) -> None:
-        for handle in self._handles:
-            handle.remove()
-        self._handles = []
-
-
-def subsample_valid_tokens(
-    z: torch.Tensor,
-    attention_mask: torch.Tensor,
-    n_tokens: int,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Samples up to n_tokens rows without replacement from the non-padded
-    positions of z. z: (batch, seq, d_model). attention_mask: (batch, seq),
-    1 for real tokens / 0 for padding — padded positions carry no meaningful
-    representation and would pollute the geometry estimate.
-    """
-    flat_z = z.reshape(-1, z.shape[-1])
-    flat_mask = attention_mask.reshape(-1).bool()
-    valid = flat_z[flat_mask]
-    n = min(n_tokens, valid.shape[0])
-    if n == 0:
-        return valid
-    idx = torch.randperm(valid.shape[0], generator=generator)[:n]
-    return valid[idx]
-
-
-def compute_tokens_per_batch(max_pool_size: int, n_sequences: int, batch_size: int) -> int:
-    """Derives how many tokens to pool from EACH batch, given a target TOTAL
-    pooled-token budget PER LAYER for the whole run.
-
-    A fixed per-batch quota (the original design) makes total pooled memory
-    scale linearly with n_sequences: at n_sequences=1000 on the real 32-layer,
-    4096-dim Mistral-7B, pooling 512 tokens/batch across ~125 batches, in
-    float64, for both pre- and post-attention, across all 32 layers held in
-    memory at once, needs ~125GB — which is exactly what OOM-killed a real
-    run on a 48GB machine. Deriving the per-batch quota from a fixed total
-    budget instead keeps memory roughly constant (~max_pool_size tokens/layer)
-    no matter how large n_sequences gets.
-    """
-    expected_n_batches = max(1, math.ceil(n_sequences / batch_size))
-    return max(1, max_pool_size // expected_n_batches)
-
-
-@torch.no_grad()
-def collect_layer_activations(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    device: str,
-    tokens_per_batch: int,
-    seed: int,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Runs the model over every batch in `loader`, subsampling
-    `tokens_per_batch` valid tokens per batch at every layer, and pools them
-    across batches. Returns (pre_attention, post_attention), each a list
-    (one entry per layer) of (n_pooled_tokens, d_model) float32 arrays.
-
-    `tokens_per_batch` should be derived from a total per-layer budget via
-    compute_tokens_per_batch, not passed as a large fixed constant — see that
-    function's docstring for why a fixed per-batch quota doesn't scale.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    pre_pool: list[list[torch.Tensor]] = None
-    post_pool: list[list[torch.Tensor]] = None
-
-    with AttentionOutputCapture(model) as capture:
-        for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-
-            capture.outputs = []  # hooks only append; clear before each batch's forward pass
-            outputs = model(
-                input_ids, attention_mask=attention_mask, output_hidden_states=True
-            )
-            n_layers = len(capture.outputs)
-
-            if pre_pool is None:
-                pre_pool = [[] for _ in range(n_layers)]
-                post_pool = [[] for _ in range(n_layers)]
-
-            # one shared sample of valid-token positions per batch, reused
-            # across every layer's pre/post tensors for a like-for-like
-            # pre-vs-post-attention comparison at the same tokens
-            flat_mask = attention_mask.reshape(-1).bool()
-            n_valid = int(flat_mask.sum().item())
-            n = min(tokens_per_batch, n_valid)
-            sample_idx = torch.randperm(n_valid, generator=generator)[:n]
-            d_model_dim = outputs.hidden_states[0].shape[-1]
-
-            for layer_idx in range(n_layers):
-                pre = outputs.hidden_states[layer_idx].reshape(-1, d_model_dim)
-                post = capture.outputs[layer_idx].reshape(-1, d_model_dim)
-                pre_pool[layer_idx].append(pre[flat_mask][sample_idx].cpu())
-                post_pool[layer_idx].append(post[flat_mask][sample_idx].cpu())
-
-    # Chunks are kept in the model's own compute dtype (e.g. bf16) while
-    # accumulating, then cast to float32 only once here — bf16 has no native
-    # numpy representation (.numpy() would raise), and NystromDiffusionMap
-    # already upcasts to float64 internally itself, one layer at a time, so
-    # doing it here too (on all layers held in memory at once) would only
-    # double memory for no benefit.
-    pre_arrays = [torch.cat(layer_chunks, dim=0).float().numpy() for layer_chunks in pre_pool]
-    post_arrays = [torch.cat(layer_chunks, dim=0).float().numpy() for layer_chunks in post_pool]
-    return pre_arrays, post_arrays
 
 
 def nystrom_approximation_error(
@@ -261,6 +133,35 @@ def _pairwise_dist(X: np.ndarray) -> np.ndarray:
     return squareform(pdist(X, metric="euclidean"))
 
 
+def pool_diagnostics(Z: np.ndarray) -> dict[str, float]:
+    """Cheap, no-model-inference-required stats on a pooled-token array that
+    distinguish the two disconnection hypotheses without rerunning anything:
+
+    - token_norm_max_to_median: a handful of outlier-norm tokens (e.g.
+      attention-sink / massive-activation positions, well documented for
+      Llama/Mistral-family models) show up as a huge ratio here even though
+      only a few rows are affected.
+    - duplicate_fraction: bf16 has ~3 decimal digits of precision, so if many
+      pooled activations round to identical bf16 values, this fraction will
+      be far from 0 — that alone can degenerate the median-heuristic
+      bandwidth to ~0 (see bandwidth_median_heuristic's zero-median fallback).
+    """
+    norms = np.linalg.norm(Z, axis=1)
+    median_norm = float(np.median(norms))
+    max_norm = float(norms.max())
+    n_unique = int(np.unique(Z, axis=0).shape[0])
+    n_total = int(Z.shape[0])
+    return {
+        "token_norm_min": float(norms.min()),
+        "token_norm_median": median_norm,
+        "token_norm_max": max_norm,
+        "token_norm_max_to_median": max_norm / median_norm if median_norm > 0 else float("inf"),
+        "n_tokens": n_total,
+        "n_unique_tokens": n_unique,
+        "duplicate_fraction": float(1.0 - n_unique / n_total) if n_total > 0 else 0.0,
+    }
+
+
 def analyze_layer(
     pre_Z: np.ndarray,
     post_Z: np.ndarray,
@@ -298,12 +199,33 @@ def analyze_layer(
         post_Z, m_values, n_components=n_components, t=t, alpha=alpha, random_state=random_state
     )
 
+    # NystromDiffusionMap.eigenvalues_ already excludes the trivial top
+    # eigenvalue (~1, the constant eigenvector). If the largest REMAINING
+    # eigenvalue is still ~1, the landmark Markov chain has more than one
+    # eigenvalue at/near 1 — i.e. the kernel graph is disconnected (or
+    # numerically so) into near-isolated components, most likely because a
+    # few landmarks sit on extreme-norm outlier tokens (e.g. attention-sink /
+    # BOS positions, well documented for Llama/Mistral-family models) that
+    # the median-heuristic bandwidth can't bridge. When that happens, a tiny
+    # r* reflects graph fragmentation, not a genuine low-dimensional
+    # manifold, and should NOT be read as confirming the manifold hypothesis.
+    likely_disconnected = bool(post_ndm.eigenvalues_[0] > 0.999)
+
     return {
         "r_star_post_attention": r_star_post,
         "r_star_pre_attention": r_star_pre,
         "spectral_gap": delta,
         "nystrom_error": {str(m): err for m, err in nystrom_error.items()},
         "top_eigenvalues": post_ndm.eigenvalues_[:5].tolist(),
+        "likely_disconnected": likely_disconnected,
+        # eps_ near float64 machine epsilon (~2.2e-16) means the zero-median
+        # fallback in bandwidth_median_heuristic fired — i.e. many landmark
+        # points were exact/near duplicates (see pool_diagnostics below for
+        # the token-level evidence of that).
+        "post_eps": post_ndm.eps_,
+        "pre_eps": pre_ndm.eps_,
+        "post_pool_diagnostics": pool_diagnostics(post_Z),
+        "pre_pool_diagnostics": pool_diagnostics(pre_Z),
     }
 
 
@@ -424,10 +346,46 @@ def main() -> None:
     mean_r_star = sum(layer["r_star_post_attention"] for layer in results["layers"]) / len(
         results["layers"]
     )
+    n_disconnected = sum(1 for layer in results["layers"] if layer["likely_disconnected"])
+
     print(f"Saved {json_path}")
     print(f"Saved {png_path}")
     print(f"Mean r* = {mean_r_star:.1f} vs d_model = {d_model}")
-    if mean_r_star < d_model * 0.5:
+
+    if n_disconnected > 0:
+        print(
+            f"WARNING: {n_disconnected}/{len(results['layers'])} layers show a "
+            "leading non-trivial eigenvalue ~1 — the landmark kernel graph is "
+            "likely fragmenting into near-disconnected components (e.g. from "
+            "outlier/attention-sink tokens), which trivially deflates r* without "
+            "reflecting a genuine low-dimensional manifold. Do NOT treat this run "
+            "as confirming the manifold hypothesis until that's ruled out — see "
+            "'likely_disconnected' per layer in the saved JSON."
+        )
+        # Cheap breakdown of the two candidate causes, so the JSON doesn't
+        # have to be hand-inspected to tell them apart:
+        #  - near-machine-epsilon eps_ -> zero-median fallback fired ->
+        #    duplicate/near-duplicate landmark points (bf16-rounding collapse)
+        #  - large token_norm_max_to_median with few duplicates -> genuine
+        #    outlier-norm tokens (attention-sink / massive-activation)
+        min_eps = min(layer["post_eps"] for layer in results["layers"])
+        max_dup_frac = max(
+            layer["post_pool_diagnostics"]["duplicate_fraction"] for layer in results["layers"]
+        )
+        max_norm_ratio = max(
+            layer["post_pool_diagnostics"]["token_norm_max_to_median"]
+            for layer in results["layers"]
+        )
+        print(
+            f"  diagnostics: min post_eps={min_eps:.3g} "
+            f"(machine eps={np.finfo(np.float64).eps:.3g}), "
+            f"max duplicate_fraction={max_dup_frac:.3f}, "
+            f"max token_norm_max_to_median={max_norm_ratio:.1f}"
+        )
+    # "<<" (much less than) is the guide's actual criterion, not merely "less
+    # than" — an order-of-magnitude margin is used here so a weakly-compressed
+    # r* (e.g. d_model/2) can't slip through as a false "holds".
+    elif mean_r_star < d_model / 10:
         print("r* << d_model: manifold hypothesis holds — proceed to training.")
     else:
         print("r* is NOT much smaller than d_model: revisit the kernel design before training.")

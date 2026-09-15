@@ -33,12 +33,21 @@ class NystromDiffusionMap:
         t: int = 3,
         alpha: float = 1.0,
         random_state: int = 42,
+        eps: float | None = None,
     ) -> None:
         self.n_landmarks = n_landmarks
         self.n_components = n_components
         self.t = t
         self.alpha = alpha
         self.random_state = random_state
+        # Overrides the median-heuristic bandwidth with a fixed value when
+        # set, instead of deriving eps_ from the landmarks at fit() time.
+        # Lets callers hold everything else (landmarks included, since
+        # k-means with a fixed random_state on the same Z is deterministic)
+        # fixed while sweeping only the kernel scale — see
+        # geometry/multiscale.py, which needs exactly that to isolate what
+        # changes as eps varies from what changes as the landmarks do.
+        self.eps = eps
 
         self.landmarks_: np.ndarray | None = None
         self.eps_: float | None = None
@@ -61,7 +70,9 @@ class NystromDiffusionMap:
         kmeans.fit(Z)
         self.landmarks_ = kmeans.cluster_centers_
 
-        self.eps_ = bandwidth_median_heuristic(self.landmarks_)
+        self.eps_ = self.eps if self.eps is not None else bandwidth_median_heuristic(
+            self.landmarks_
+        )
         K = gaussian_kernel(self.landmarks_, self.eps_)
         P = coifman_lafon_normalise(K, alpha=self.alpha)
 

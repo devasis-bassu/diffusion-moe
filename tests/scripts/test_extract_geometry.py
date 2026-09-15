@@ -217,11 +217,50 @@ def test_analyze_layer_returns_expected_keys_and_sane_values():
         "spectral_gap",
         "nystrom_error",
         "top_eigenvalues",
+        "likely_disconnected",
+        "post_eps",
+        "pre_eps",
+        "post_pool_diagnostics",
+        "pre_pool_diagnostics",
     }
     assert 1 <= result["r_star_post_attention"] <= 5
     assert 1 <= result["r_star_pre_attention"] <= 5
     assert set(result["nystrom_error"].keys()) == {"8", "16", "32"}
     assert len(result["top_eigenvalues"]) == 5
+    assert isinstance(result["likely_disconnected"], bool)
+    assert result["post_eps"] > 0
+    assert result["post_pool_diagnostics"]["n_tokens"] == 200
+    assert result["post_pool_diagnostics"]["duplicate_fraction"] == 0.0
+
+
+def test_analyze_layer_flags_disconnected_clusters():
+    # A large main cluster plus a handful of extreme-norm outlier points
+    # (mimicking real attention-sink / massive-activation tokens) so that
+    # >95% of pairwise distances are small, within-cluster ones: the
+    # median-heuristic bandwidth locks onto that small scale, making the
+    # ~1e4-away outliers get ~zero kernel affinity to everything else. That
+    # near-isolated component gives the landmark Markov chain a second
+    # eigenvalue at/near 1, which should trip the disconnection flag rather
+    # than be read as a tiny, genuine intrinsic dimension.
+    rng = np.random.RandomState(0)
+    main_cluster = rng.randn(195, 8)
+    outliers = rng.randn(5, 8) * 0.1 + np.array([1e4, 0, 0, 0, 0, 0, 0, 0])
+    post_Z = np.vstack([main_cluster, outliers])
+    pre_Z = np.vstack([main_cluster, outliers])
+
+    result = eg.analyze_layer(
+        pre_Z, post_Z, n_landmarks=32, n_components=5, m_values=[8, 16, 32]
+    )
+
+    assert result["likely_disconnected"] is True
+    assert result["top_eigenvalues"][0] > 0.999
+    # The diagnostics should point at the outlier-norm hypothesis (large
+    # token_norm_max_to_median), not the duplicate-landmark hypothesis
+    # (near-zero eps / high duplicate_fraction) — these 200 points are all
+    # distinct floats.
+    assert result["post_pool_diagnostics"]["token_norm_max_to_median"] > 100
+    assert result["post_pool_diagnostics"]["duplicate_fraction"] == 0.0
+    assert result["post_eps"] > np.finfo(np.float64).eps * 10
 
 
 def test_run_geometry_extraction_end_to_end_with_tiny_model():

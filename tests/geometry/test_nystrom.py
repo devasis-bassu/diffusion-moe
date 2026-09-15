@@ -52,6 +52,30 @@ def test_transform_reproduces_fit_transform_on_same_data():
     assert np.allclose(Psi_fit, Psi_again)
 
 
+def test_eps_override_skips_median_heuristic():
+    Z = _make_data(n=200)
+    auto = NystromDiffusionMap(n_landmarks=32, n_components=10, random_state=0)
+    auto.fit(Z)
+
+    fixed = NystromDiffusionMap(n_landmarks=32, n_components=10, random_state=0, eps=123.0)
+    fixed.fit(Z)
+
+    assert fixed.eps_ == 123.0
+    assert fixed.eps_ != auto.eps_
+
+
+def test_eps_override_same_seed_reuses_same_landmarks():
+    """A fixed random_state makes k-means deterministic given the same Z, so
+    varying only `eps` (as geometry/multiscale.py's dyadic sweep does)
+    shouldn't also perturb which points were chosen as landmarks."""
+    Z = _make_data(n=200)
+    ndm_a = NystromDiffusionMap(n_landmarks=32, n_components=10, random_state=0, eps=1.0)
+    ndm_b = NystromDiffusionMap(n_landmarks=32, n_components=10, random_state=0, eps=50.0)
+    ndm_a.fit(Z)
+    ndm_b.fit(Z)
+    np.testing.assert_array_equal(ndm_a.landmarks_, ndm_b.landmarks_)
+
+
 def test_eigenvalues_decrease_diffusion_time_shrinks_coordinates():
     Z = _make_data(n=150)
     ndm_t1 = NystromDiffusionMap(n_landmarks=40, n_components=5, t=1, alpha=1.0, random_state=0)
