@@ -38,8 +38,11 @@ results/**/*.json
 results/**/*.pkl
 !results/**/.gitkeep
 
-# Data / HF cache (DATA_DIR target — datasets, xet cache, logs)
-data/
+# Data / HF cache (DATA_DIR target — datasets, xet cache, logs).
+# Anchored to repo root: an unanchored "data/" also matches
+# src/diffusion_moe/data/ (the real Python package) and tests/data/ — hit
+# this exact bug before with an rsync --exclude='data' pattern; same fix.
+/data/
 *.log
 
 # Jupyter
