@@ -60,3 +60,29 @@ class ExpertCentroids(nn.Module):
 
     def forward(self) -> torch.Tensor:
         return self.centroids
+
+    @torch.no_grad()
+    def clip_norm_(self, max_norm: torch.Tensor | float) -> None:
+        """Caps each centroid's distance from the origin at max_norm,
+        preserving direction — an external safeguard against
+        centroid_separation_loss's gradient, which has no upper bound on how
+        far apart it pushes centroids (verified by design in
+        test_separation.py) and can otherwise let them drift arbitrarily far
+        outside the range real diffusion coordinates actually occupy. Once
+        centroids escape that range, every token's distance to every
+        centroid becomes centroid-norm-dominated (roughly equal regardless of
+        which centroid), which collapses the router toward uniform,
+        uninformative dispatch — exactly the failure mode a real training
+        run reproduced (separation loss magnitude growing ~4 orders of
+        magnitude over 300 steps while the load-balance loss read exactly
+        0.0 throughout).
+
+        Call after each optimizer step, with max_norm derived from the
+        current layer's own scale (e.g. routing.separation.landmark_scale
+        times a small constant factor) — NOT a fixed global constant, since
+        the natural scale of diffusion coordinates can differ across layers
+        and training progress.
+        """
+        norms = self.centroids.data.norm(dim=-1, keepdim=True)
+        factor = (max_norm / norms).clamp(max=1.0)
+        self.centroids.data.mul_(factor)

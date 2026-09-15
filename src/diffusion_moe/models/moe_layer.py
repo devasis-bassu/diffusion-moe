@@ -12,6 +12,7 @@ from diffusion_moe.models.moe_dispatch import dispatch_and_aggregate
 from diffusion_moe.models.rmsnorm import RMSNorm
 from diffusion_moe.routing.centroids import ExpertCentroids
 from diffusion_moe.routing.router import DiffusionRouter
+from diffusion_moe.routing.separation import landmark_scale
 
 
 class DiffusionMoELayer(nn.Module):
@@ -45,6 +46,7 @@ class DiffusionMoELayer(nn.Module):
         norm_eps: float = 1e-5,
         dropout: float = 0.0,
         centroid_refresh_steps: int = 500,
+        noise_std: float = 0.0,
     ) -> None:
         super().__init__()
         ffn_dim = ffn_dim if ffn_dim is not None else 4 * d_model
@@ -64,7 +66,7 @@ class DiffusionMoELayer(nn.Module):
             n_landmarks=n_landmarks, n_components=n_components, t=diffusion_t, alpha=alpha
         )
         self.centroids = ExpertCentroids(n_experts=n_experts, n_components=n_components)
-        self.router = DiffusionRouter(n_experts=n_experts, top_k=top_k, tau=tau)
+        self.router = DiffusionRouter(n_experts=n_experts, top_k=top_k, tau=tau, noise_std=noise_std)
         self.experts = nn.ModuleList(
             [
                 ExpertFFN(d_model, ffn_dim, n_experts, overlap_factor=overlap_factor)
@@ -118,21 +120,37 @@ class DiffusionMoELayer(nn.Module):
         if not self.centroids.is_initialised:
             self.centroids.initialise_from_batch(Psi_t)
 
-        gate_values, expert_indices, router_logits = self.router(Psi_t, self.centroids())
+        psi_landmarks = torch.from_numpy(self.ndm.psi_landmarks_).to(
+            dtype=x.dtype, device=x.device
+        )
+        # Route on SCALE-NORMALIZED coordinates, not raw Psi_t — real
+        # diffusion coordinates (Psi_t = eigenvector * eigenvalue^t) can be
+        # vanishingly small in absolute terms (verified on real Mistral-7B
+        # activations at |Psi_t| ~ 1e-7 for diffusion_t=3), which makes ANY
+        # fixed, O(1)-scale tau give a softmax numerically indistinguishable
+        # from uniform regardless of which centroid is actually closest — a
+        # real training run of this exact mechanism (via pilot_finetune.py's
+        # PilotMoEBlock, which shares this router) confirmed exactly that
+        # failure mode. Dividing by scale (the typical landmark-to-landmark
+        # spacing) makes tau operate in a consistent, dimensionless unit
+        # instead of this layer's own raw coordinate magnitude.
+        scale = landmark_scale(psi_landmarks)
+        Psi_t_scaled = Psi_t / scale
+        centroids_scaled = self.centroids() / scale
+        psi_landmarks_scaled = psi_landmarks / scale
+
+        gate_values, expert_indices, router_logits = self.router(Psi_t_scaled, centroids_scaled)
 
         ffn_input = self.ffn_norm(x)
         expert_out = self._dispatch_and_aggregate(ffn_input, gate_values, expert_indices)
         output = x + expert_out
 
-        psi_landmarks = torch.from_numpy(self.ndm.psi_landmarks_).to(
-            dtype=x.dtype, device=x.device
-        )
         aux = {
             "router_logits": router_logits,
             "gate_values": gate_values,
             "expert_indices": expert_indices,
-            "Psi_t": Psi_t,
-            "centroids": self.centroids(),
-            "Psi_landmarks": psi_landmarks,
+            "Psi_t": Psi_t_scaled,
+            "centroids": centroids_scaled,
+            "Psi_landmarks": psi_landmarks_scaled,
         }
         return output, aux
