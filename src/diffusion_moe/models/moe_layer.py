@@ -139,7 +139,23 @@ class DiffusionMoELayer(nn.Module):
         if self.cosine:
             z_flat = l2_normalize(z_flat)
 
-        should_refresh = int(self._step.item()) % self.centroid_refresh_steps == 0
+        # self.ndm's fitted state (landmarks_, eigenvectors_, eps_, ...) lives
+        # on a plain Python object, not an nn.Module -- it's never part of
+        # state_dict(), so it does NOT survive a checkpoint save/load. Only
+        # _step (a registered buffer) does. A fresh model loaded from a
+        # checkpoint therefore has the *correct* _step but landmarks_ is None
+        # -- without this check, should_refresh would be False whenever
+        # _step isn't exactly on a centroid_refresh_steps boundary (the
+        # common case), and .transform() would crash outright on the very
+        # first forward pass: real training resume with an active MoE layer,
+        # and any post-hoc analysis of a saved checkpoint (e.g.
+        # scripts/expert_attribution.py), both hit this identically. Missed
+        # by the original resume regression test because it used a dense
+        # model (layers_to_replace=[]), never touching this path at all.
+        should_refresh = (
+            self.ndm.landmarks_ is None
+            or int(self._step.item()) % self.centroid_refresh_steps == 0
+        )
         if should_refresh:
             psi_flat = self.ndm.fit_transform(z_flat)
         else:

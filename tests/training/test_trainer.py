@@ -151,6 +151,31 @@ def test_resume_from_checkpoint_restores_step_and_weights(tmp_path):
         assert torch.equal(p1, p2)
 
 
+def test_resumed_moe_layer_does_not_crash_when_step_is_off_the_refit_schedule(tmp_path):
+    """Real bug found running scripts/expert_attribution.py against an actual
+    checkpoint: NystromDiffusionMap's fitted state (landmarks_, eigenvectors_,
+    ...) lives on a plain Python object, not an nn.Module -- it's never part
+    of state_dict(), so it does NOT survive save/load, unlike _step (a
+    registered buffer, which does). A freshly loaded model therefore has the
+    *correct* _step but landmarks_ is None. Every earlier resume test used
+    layers_to_replace=[] (dense), so none of them ever touched this path --
+    this reproduces it with a real MoE layer, resumed at a step (3) that
+    isn't a multiple of centroid_refresh_steps (1000, _make_model's default),
+    the common case for any real resume.
+    """
+    t = _make_trainer(tmp_path, layers_to_replace=[0])
+    t.train(max_steps=3)
+    t.save_checkpoint(t.checkpoint_dir / "manual.pt")
+
+    t2 = _make_trainer(tmp_path, layers_to_replace=[0])
+    t2.load_checkpoint(t.checkpoint_dir / "manual.pt")
+    assert t2.step == 3
+    assert t2.step % 1000 != 0  # sanity: genuinely off the refit schedule
+
+    t2.train(max_steps=4)  # must not raise
+    assert t2.step == 4
+
+
 def test_resume_fast_forwards_past_already_consumed_batches(tmp_path):
     """The actual bug this fixes: a freshly built train_loader always starts
     its (deterministically ordered) stream from the beginning. Without
