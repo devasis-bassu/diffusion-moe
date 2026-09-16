@@ -23,7 +23,7 @@ def build_dataloaders(config: Any) -> tuple[DataLoader, DataLoader]:
     """Builds (train_loader, val_loader) from a config exposing a `data` section.
 
     Expected fields under config.data: dataset, tokenizer, max_seq_len, batch_size,
-    num_workers, val_tokens, and optionally prefetch_factor.
+    num_workers, val_tokens, and optionally prefetch_factor, local_data_files.
     """
     data_cfg = _get(config, "data", config)
 
@@ -35,6 +35,11 @@ def build_dataloaders(config: Any) -> tuple[DataLoader, DataLoader]:
     prefetch_factor = _get(data_cfg, "prefetch_factor", 2)
     val_tokens = _get(data_cfg, "val_tokens", 0)
     seed = _get(data_cfg, "seed", 42)
+    # See StreamingTextDataset's own docstring: bypasses Hub streaming (a
+    # recurring flaky-CDN stall hit repeatedly across this investigation) by
+    # reading already-downloaded local parquet files directly. None by
+    # default, so behavior is unchanged unless explicitly set.
+    local_data_files = _get(data_cfg, "local_data_files", None)
 
     tokenizer = TokenizerWrapper(tokenizer_name)
     collate = partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
@@ -55,6 +60,7 @@ def build_dataloaders(config: Any) -> tuple[DataLoader, DataLoader]:
         seed=seed,
         num_shards=get_world_size(),
         shard_index=get_rank(),
+        local_data_files=local_data_files,
     )
     val_dataset = StreamingTextDataset(
         dataset_name,
@@ -63,6 +69,7 @@ def build_dataloaders(config: Any) -> tuple[DataLoader, DataLoader]:
         split="train",
         take=val_n_examples or 1,
         seed=seed,
+        local_data_files=local_data_files,
     )
 
     loader_kwargs: dict[str, Any] = {"num_workers": num_workers}

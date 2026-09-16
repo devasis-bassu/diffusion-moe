@@ -206,6 +206,22 @@ def test_moe_layer_produces_nonzero_aux_losses(tmp_path):
     assert metrics["load_loss"] != 0.0 or metrics["sep_loss"] != 0.0
 
 
+def test_train_step_exposes_per_layer_load_loss_for_multiple_moe_layers(tmp_path):
+    """With two DiffusionMoELayers active, train_step's returned metrics must
+    break load_loss down per layer, not just the aggregate mean -- otherwise
+    a full collapse at one layer masked by balance at another is invisible
+    to anything watching training (the actual motivation: run all layers as
+    diffusion-MoE and see, per layer, what happens)."""
+    t = _make_trainer(tmp_path, layers_to_replace=[0, 1])
+    metrics = t.train_step([next(iter(t.train_loader))])
+
+    assert "load_loss/layer_0" in metrics
+    assert "load_loss/layer_1" in metrics
+    assert "load_loss/layer_2" not in metrics  # layer 2 wasn't replaced
+    manual_mean = (metrics["load_loss/layer_0"] + metrics["load_loss/layer_1"]) / 2
+    assert abs(metrics["load_loss"] - manual_mean) < 1e-5
+
+
 def test_train_step_clips_centroid_norms_after_optimizer_step(tmp_path):
     """The actual gap this closes: ExpertCentroids.clip_norm_() existed but
     was only ever called by scripts/pilot_finetune.py's own bespoke training

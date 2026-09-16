@@ -33,9 +33,11 @@ class FakeStreamingTextDataset(IterableDataset):
         seed=42,
         num_shards=1,
         shard_index=0,
+        local_data_files=None,
     ) -> None:
         self.num_shards = num_shards
         self.shard_index = shard_index
+        self.local_data_files = local_data_files
         examples = FIXED_EXAMPLES[skip:]
         if take is not None:
             examples = examples[:take]
@@ -125,3 +127,21 @@ def test_train_dataset_unsharded_outside_distributed_run(monkeypatch):
     train_loader, _ = build_dataloaders(_make_config())
     assert train_loader.dataset.num_shards == 1
     assert train_loader.dataset.shard_index == 0
+
+
+def test_local_data_files_threaded_to_both_train_and_val_datasets(monkeypatch):
+    """Recurring flaky-CDN reliability fix (StreamingTextDataset's own
+    local_data_files) -- must be reachable from config, same as it already
+    is for pilot_finetune.py, extract_geometry.py, sink_token_diagnostic.py."""
+    _patch(monkeypatch)
+    train_loader, val_loader = build_dataloaders(
+        _make_config(local_data_files=["/tmp/fake-train.parquet"])
+    )
+    assert train_loader.dataset.local_data_files == ["/tmp/fake-train.parquet"]
+    assert val_loader.dataset.local_data_files == ["/tmp/fake-train.parquet"]
+
+
+def test_local_data_files_defaults_to_none(monkeypatch):
+    _patch(monkeypatch)
+    train_loader, _ = build_dataloaders(_make_config())
+    assert train_loader.dataset.local_data_files is None

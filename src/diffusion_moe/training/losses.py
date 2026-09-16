@@ -40,23 +40,34 @@ def total_loss(
 
     mu, nu: weights for the load-balance and separation losses respectively.
 
-    Returns a dict with "loss" (the weighted sum to call .backward() on) plus
-    each component detached, for logging.
+    Returns a dict with "loss" (the weighted sum to call .backward() on),
+    each aggregate component detached for logging, and a per-layer
+    breakdown (`load_loss/layer_{idx}`, `sep_loss/layer_{idx}` for layers
+    that have it) -- the aggregate mean hides exactly the thing worth
+    watching when more than one MoE layer is active at once: whether
+    collapse is uniform across layers or concentrated in a few (see
+    phase1_findings_report.md §3.5/§3.6's "what happens if a layer keeps
+    forcing a single expert to handle everything" discussion).
     """
     vocab_size = logits.shape[-1]
     task_loss = F.cross_entropy(
         logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=IGNORE_INDEX
     )
 
+    per_layer: dict[str, torch.Tensor] = {}
     if router_outputs:
         load_losses = []
         sep_losses = []
-        for aux in router_outputs.values():
+        for layer_idx, aux in router_outputs.items():
             n_experts = aux["router_logits"].shape[-1]
             dense_weights = F.softmax(aux["router_logits"], dim=-1)
-            load_losses.append(coefficient_of_variation_loss(dense_weights, n_experts))
+            layer_load_loss = coefficient_of_variation_loss(dense_weights, n_experts)
+            load_losses.append(layer_load_loss)
+            per_layer[f"load_loss/layer_{layer_idx}"] = layer_load_loss.detach()
             if "centroids" in aux and "Psi_landmarks" in aux:
-                sep_losses.append(centroid_separation_loss(aux["centroids"], aux["Psi_landmarks"]))
+                layer_sep_loss = centroid_separation_loss(aux["centroids"], aux["Psi_landmarks"])
+                sep_losses.append(layer_sep_loss)
+                per_layer[f"sep_loss/layer_{layer_idx}"] = layer_sep_loss.detach()
         load_loss = torch.stack(load_losses).mean()
         sep_loss = (
             torch.stack(sep_losses).mean()
@@ -74,4 +85,5 @@ def total_loss(
         "task_loss": task_loss.detach(),
         "load_loss": load_loss.detach(),
         "sep_loss": sep_loss.detach(),
+        **per_layer,
     }

@@ -175,7 +175,7 @@ class Trainer:
         """One optimizer step, gradient-accumulated over `micro_batches`."""
         self.optimizer.zero_grad(set_to_none=True)
         n = len(micro_batches)
-        totals = {"loss": 0.0, "task_loss": 0.0, "load_loss": 0.0, "sep_loss": 0.0}
+        totals: dict[str, float] = {"loss": 0.0}
 
         for micro_batch in micro_batches:
             losses = self._forward_loss(micro_batch)
@@ -187,8 +187,16 @@ class Trainer:
                 scaled_loss.backward()
 
             totals["loss"] += scaled_loss.item()
-            for key in ("task_loss", "load_loss", "sep_loss"):
-                totals[key] += losses[key].item() / n
+            # Everything else (task_loss/load_loss/sep_loss, plus any
+            # per-layer load_loss/layer_N, sep_loss/layer_N keys total_loss
+            # adds when more than one MoE layer is active) is already
+            # detached -- accumulate whatever keys are actually present
+            # rather than a fixed tuple, so this doesn't need to know in
+            # advance how many MoE layers the model has.
+            for key, value in losses.items():
+                if key == "loss":
+                    continue
+                totals[key] = totals.get(key, 0.0) + value.item() / n
 
         if self.use_scaler:
             self.scaler.unscale_(self.optimizer)

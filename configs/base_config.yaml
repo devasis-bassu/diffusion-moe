@@ -11,6 +11,10 @@ data:
   num_workers: 4
   prefetch_factor: 2
   val_tokens: 5_000_000
+  # Local parquet file path(s) to read --dataset's train split from directly,
+  # bypassing Hub streaming -- a recurring flaky-CDN stall hit repeatedly
+  # across this investigation. null by default (stream from the Hub as usual).
+  local_data_files: null
 
 routing:
   n_experts: 8

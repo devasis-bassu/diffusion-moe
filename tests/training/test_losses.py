@@ -112,6 +112,36 @@ def test_component_tensors_are_detached_but_loss_has_grad():
     assert logits.grad is not None
 
 
+def test_per_layer_breakdown_present_and_matches_the_aggregate():
+    """The whole point of the per-layer keys: with more than one MoE layer
+    active, the aggregate load_loss/sep_loss averages across layers and can
+    hide a layer that's fully collapsed while another is balanced. Confirm
+    the per-layer keys are present, correctly keyed by layer index, and
+    that their mean reproduces the existing aggregate exactly."""
+    router_outputs = _fake_router_outputs(seed=0)
+    router_outputs[3] = _fake_router_outputs(seed=1)[0]
+    logits, labels = _logits_and_labels()
+
+    result = total_loss(logits, labels, router_outputs, mu=1.0, nu=1.0)
+
+    assert set(k for k in result if k.startswith("load_loss/")) == {
+        "load_loss/layer_0",
+        "load_loss/layer_3",
+    }
+    assert set(k for k in result if k.startswith("sep_loss/")) == {
+        "sep_loss/layer_0",
+        "sep_loss/layer_3",
+    }
+    manual_mean_load = (result["load_loss/layer_0"] + result["load_loss/layer_3"]) / 2
+    assert torch.isclose(result["load_loss"], manual_mean_load, atol=1e-5)
+
+
+def test_per_layer_breakdown_empty_for_a_dense_model():
+    logits, labels = _logits_and_labels()
+    result = total_loss(logits, labels, router_outputs={}, mu=0.5, nu=0.5)
+    assert not any(k.startswith("load_loss/") or k.startswith("sep_loss/") for k in result)
+
+
 def test_mu_scales_load_loss_contribution():
     logits, labels = _logits_and_labels()
     router_outputs = _fake_router_outputs()
