@@ -23,6 +23,14 @@ routing:
   mu_load: 0.01
   nu_sep: 0.05
   centroid_refresh_steps: 500
+  centroid_max_radius_factor: 3.0
+  # Gaussian noise added to router logits during training only (noisy top-k
+  # gating, Shazeer et al. 2017) -- 0.0 = off. If set, scale relative to
+  # `tau` above: raw noise_std is divided by tau in the actual softmax, so
+  # e.g. noise_std=0.1 at tau=0.1 lands at an effective magnitude of ~1, a
+  # reasonable starting point (phase1_findings_report.md §3.5 -- a first
+  # attempt 10x too strong made router collapse measurably worse, not better).
+  noise_std: 0.0
 
 training:
   total_tokens: 30_000_000_000
@@ -48,3 +56,12 @@ resume_from_checkpoint: null
 # rest as dense TransformerBlocks. Must match between a training run and any
 # later evaluate.py/model_factory reconstruction of the same checkpoint.
 layers_to_replace: null
+# Which of the replaced layers fit their diffusion map on L2-normalized
+# (cosine) activations instead of raw ones -- null/empty = none (matches
+# this project's own 32-layer finding, phase1_findings_report.md §2.4/§7
+# recommendation 2: cosine is NOT a uniform improvement, only a fix for
+# specific layers that never connect under raw Euclidean at any bandwidth).
+# Indices outside layers_to_replace are simply inert. For Mistral-7B those
+# layers were 17, 20, 31 -- this project's own from-scratch architecture
+# hasn't been mapped the same way yet (see recommendation 3's caveat).
+cosine_layers: null

@@ -40,11 +40,19 @@ def _build_moe_layer(
     norm_eps: float,
     dropout: float,
     centroid_refresh_steps: int,
+    noise_std: float = 0.0,
+    cosine: bool = False,
 ) -> nn.Module:
     """Builds one MoE layer of the requested router type. Each variant takes
     only the subset of these hyperparameters that are meaningful for it (e.g.
     only "diffusion" uses n_components/n_landmarks/diffusion_t/alpha/
-    centroid_refresh_steps; only "diffusion" and "cosine" use tau)."""
+    centroid_refresh_steps/noise_std/cosine; only "diffusion" and "cosine"
+    use tau). `cosine` here means DiffusionMoELayer's own kernel-metric
+    choice for its diffusion map (raw-Euclidean vs. L2-normalized/cosine
+    activations before fitting) -- unrelated to the separate `router="cosine"`
+    variant (CosineMoELayer), which routes by cosine similarity directly in
+    raw d_model space with no diffusion map at all. Same word, two different
+    things at different stages of the pipeline -- see architecture.md §5."""
     if router not in _ROUTER_CLASSES:
         raise ValueError(f"Unknown router '{router}'. Supported: {sorted(_ROUTER_CLASSES)}")
 
@@ -70,6 +78,8 @@ def _build_moe_layer(
             alpha=alpha,
             tau=tau,
             centroid_refresh_steps=centroid_refresh_steps,
+            noise_std=noise_std,
+            cosine=cosine,
         )
     if router == "cosine":
         return CosineMoELayer(**common, tau=tau)
@@ -101,6 +111,8 @@ class DiffusionMoETransformer(nn.Module):
         centroid_refresh_steps: int = 500,
         router: str = "diffusion",
         layers_to_replace: list[int] | None = None,
+        noise_std: float = 0.0,
+        cosine_layers: list[int] | None = None,
         tie_embeddings: bool = True,
     ) -> None:
         super().__init__()
@@ -113,6 +125,16 @@ class DiffusionMoETransformer(nn.Module):
             if not 0 <= idx < n_layers:
                 raise ValueError(f"layers_to_replace index {idx} out of range [0, {n_layers})")
         self.layers_to_replace = replace
+
+        # Per-layer, not a project-wide switch -- see the recommendation
+        # this implements in _build_moe_layer's docstring. Layer indices
+        # here that aren't also in layers_to_replace are simply inert (no
+        # DiffusionMoELayer gets built there to apply it to).
+        cosine_set = set(cosine_layers) if cosine_layers else set()
+        for idx in cosine_set:
+            if not 0 <= idx < n_layers:
+                raise ValueError(f"cosine_layers index {idx} out of range [0, {n_layers})")
+        self.cosine_layers = cosine_set
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
@@ -138,6 +160,8 @@ class DiffusionMoETransformer(nn.Module):
                         norm_eps=norm_eps,
                         dropout=dropout,
                         centroid_refresh_steps=centroid_refresh_steps,
+                        noise_std=noise_std,
+                        cosine=layer_idx in cosine_set,
                     )
                 )
             else:

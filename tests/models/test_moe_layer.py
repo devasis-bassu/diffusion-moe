@@ -69,6 +69,34 @@ def test_step_counter_advances_only_in_training_mode():
     assert layer._step.item() == 1
 
 
+def test_cosine_false_by_default_matches_prior_behavior():
+    layer = _make_layer()
+    assert layer.cosine is False
+
+
+def test_cosine_true_fits_on_l2_normalized_activations():
+    """Confirms cosine=True actually changes what gets fit, not just that the
+    flag is stored. Landmarks are k-means centroids -- a convex combination
+    (mean) of whichever points get assigned to a cluster -- so if the INPUT
+    to k-means was L2-normalized (every point norm exactly 1), every
+    landmark's norm must be <= 1 by the triangle inequality, regardless of
+    cluster assignment. Raw torch.randn activations at D_MODEL=64 have no
+    such bound (norm ~= sqrt(64) = 8 in expectation) -- a clear, reliable
+    discriminator between "fit on raw activations" and "fit on normalized
+    ones" without needing to inspect intermediate arrays directly.
+    """
+    x, positions = _inputs()
+
+    raw_layer = _make_layer(cosine=False)
+    raw_layer(x, positions)
+    assert raw_layer.ndm.landmarks_.max(axis=-1).max() > 1.0  # some coordinate exceeds 1
+
+    cosine_layer = _make_layer(cosine=True)
+    cosine_layer(x, positions)
+    landmark_norms = (cosine_layer.ndm.landmarks_**2).sum(axis=-1) ** 0.5
+    assert (landmark_norms <= 1.0 + 1e-6).all()
+
+
 def test_refresh_schedule_triggers_refit_every_n_steps():
     """centroid_refresh_steps=5: steps 0, 5, 10, ... refit (fit_transform);
     others reuse the frozen landmarks via transform(). We can't observe this

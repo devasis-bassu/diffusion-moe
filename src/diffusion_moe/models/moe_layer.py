@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from diffusion_moe.geometry.multiscale import l2_normalize
 from diffusion_moe.geometry.nystrom import NystromDiffusionMap
 from diffusion_moe.models.attention import RoPEMultiHeadAttention
 from diffusion_moe.models.expert_ffn import ExpertFFN
@@ -47,6 +48,7 @@ class DiffusionMoELayer(nn.Module):
         dropout: float = 0.0,
         centroid_refresh_steps: int = 500,
         noise_std: float = 0.0,
+        cosine: bool = False,
     ) -> None:
         super().__init__()
         ffn_dim = ffn_dim if ffn_dim is not None else 4 * d_model
@@ -55,6 +57,23 @@ class DiffusionMoELayer(nn.Module):
         self.top_k = top_k
         self.n_components = n_components
         self.centroid_refresh_steps = centroid_refresh_steps
+        # Whether to fit/transform the diffusion map on L2-normalized (cosine
+        # kernel) rather than raw activations. Off by default: the full
+        # 32-layer multiscale sweep (phase1_findings_report.md §2.4) found
+        # cosine is NOT a strict improvement -- raw Euclidean reports a
+        # higher intrinsic dimension than cosine at 13 of 29 comparable
+        # layers, meaning cosine discards real magnitude information at a
+        # meaningful fraction of layers. The recommended usage (§7,
+        # recommendation 2) is selective, not uniform: enable this only for
+        # layers that actually need it -- confirmed to be 17, 20, and 31 for
+        # Mistral-7B, the three layers that never connect under raw Euclidean
+        # at ANY bandwidth tested, not just this kill-switch's default one.
+        # PilotMoEBlock (the pilot fine-tune's version of this same block)
+        # already has this option, defaulting to True there for unrelated
+        # reasons specific to that one-layer splice; this brings the
+        # production layer up to the same capability without inheriting that
+        # default, matching the selective recommendation.
+        self.cosine = cosine
 
         self.attn_norm = RMSNorm(d_model, eps=norm_eps)
         self.attn = RoPEMultiHeadAttention(
@@ -93,6 +112,8 @@ class DiffusionMoELayer(nn.Module):
         # DtypeCastWrapper/PilotMoEBlock already cast to fp32 for other
         # reasons, incidentally avoiding this exact crash).
         z_flat = z.detach().reshape(-1, d_model).float().cpu().numpy()
+        if self.cosine:
+            z_flat = l2_normalize(z_flat)
 
         should_refresh = int(self._step.item()) % self.centroid_refresh_steps == 0
         if should_refresh:

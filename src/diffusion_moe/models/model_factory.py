@@ -28,4 +28,6 @@ def build_model_from_config(cfg: Any) -> DiffusionMoETransformer:
         centroid_refresh_steps=cfg.routing.centroid_refresh_steps,
         router=cfg.model.get("router", "diffusion"),
         layers_to_replace=cfg.get("layers_to_replace", None),
+        noise_std=cfg.routing.get("noise_std", 0.0),
+        cosine_layers=cfg.get("cosine_layers", None),
     )

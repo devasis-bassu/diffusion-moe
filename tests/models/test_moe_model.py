@@ -85,6 +85,44 @@ def test_invalid_layer_index_raises():
         _model(layers_to_replace=[N_LAYERS])  # out of range
 
 
+def test_cosine_layers_sets_cosine_flag_only_on_the_given_diffusion_layers():
+    """cosine_layers is per-layer, not a project-wide switch (see the
+    recommendation this implements: phase1_findings_report.md §2.4/§7's
+    recommendation 2 -- cosine is a fix for specific layers, not a uniform
+    default). Layer 2 should get cosine=True, layers 0 and 1 (also
+    DiffusionMoELayer, since layers_to_replace defaults to every layer)
+    should not."""
+    model = _model(cosine_layers=[2])
+    assert model.blocks[0].cosine is False
+    assert model.blocks[1].cosine is False
+    assert model.blocks[2].cosine is True
+
+
+def test_cosine_layers_index_outside_layers_to_replace_is_inert():
+    """A cosine_layers index for a layer that isn't itself replaced (still
+    dense) has nothing to apply to -- must not raise, and the dense block
+    stays a plain TransformerBlock."""
+    model = _model(layers_to_replace=[1], cosine_layers=[0, 1])
+    assert isinstance(model.blocks[0], TransformerBlock)
+    assert model.blocks[1].cosine is True
+
+
+def test_cosine_layers_defaults_to_no_layers_using_cosine():
+    model = _model()
+    assert all(block.cosine is False for block in model.blocks)
+
+
+def test_invalid_cosine_layers_index_raises():
+    with pytest.raises(ValueError):
+        _model(cosine_layers=[N_LAYERS])  # out of range
+
+
+def test_noise_std_threaded_to_every_diffusion_layers_router():
+    model = _model(noise_std=0.25)
+    for block in model.blocks:
+        assert block.router.noise_std == 0.25
+
+
 @pytest.mark.parametrize(
     "router,expected_class",
     [
