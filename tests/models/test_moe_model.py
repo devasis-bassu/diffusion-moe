@@ -34,6 +34,64 @@ def _model(**overrides):
     return DiffusionMoETransformer(**kwargs)
 
 
+def test_token_embedding_uses_small_std_not_default_normal_1():
+    """nn.Embedding's default init is Normal(0, 1) -- std=1.0. Dramatically
+    too large for a transformer embedding table, and especially costly since
+    tie_embeddings=True by default makes this same matrix double as the
+    LM-head unembedding projection. Root-caused a real anomaly: this
+    project's own from-scratch 24-layer/every-layer-MoE config had initial
+    task_loss ~823 nats against a random-guessing baseline of
+    ln(32000)=10.4 -- traced to logits with max abs ~828 at random init,
+    which in turn traced to this embedding init."""
+    torch.manual_seed(0)
+    model = _model()
+    assert model.token_embedding.weight.std().item() < 0.1
+
+
+def test_residual_output_projections_are_scaled_down_by_depth():
+    """The other half of the same fix: out_proj (attention) and down_proj
+    (every FFN -- dense, routed expert, and shared expert alike) should be
+    visibly smaller than what nn.Linear's own default init alone would give,
+    scaled by 1/sqrt(2*n_layers) (GPT-2/nanoGPT convention) -- otherwise
+    residual-stream variance compounds with depth."""
+    torch.manual_seed(0)
+    scaled_model = _model()
+
+    torch.manual_seed(0)
+    unscaled_out_proj = torch.nn.Linear(D_MODEL, D_MODEL, bias=False)  # same shape as out_proj
+
+    scale = 1.0 / (2 * N_LAYERS) ** 0.5
+    expected_std = unscaled_out_proj.weight.std().item() * scale
+    actual_std = scaled_model.blocks[0].attn.out_proj.weight.std().item()
+    assert abs(actual_std - expected_std) / expected_std < 0.15  # same seed, same shape -> close
+
+
+def test_random_init_task_loss_near_random_guessing_baseline():
+    """The actual end-to-end check: cross-entropy of a freshly initialized
+    model against random labels should land near ln(vocab_size) -- a
+    properly-calibrated random init is, by construction, close to a uniform
+    guess over the vocabulary. Before the embedding-std and residual-output-
+    scaling fixes, this was ~80x too high on the real 300M/24-layer config
+    (823 nats vs. ln(32000)=10.4); this test uses a tiny config for speed,
+    but checks the same invariant."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    model = _model()
+    model.eval()
+    input_ids = torch.randint(0, VOCAB_SIZE, (BATCH, SEQ_LEN))
+    labels = torch.randint(0, VOCAB_SIZE, (BATCH, SEQ_LEN))
+
+    with torch.no_grad():
+        logits, _, _ = model(input_ids)
+    loss = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), labels.reshape(-1))
+
+    import math
+
+    random_baseline = math.log(VOCAB_SIZE)
+    assert loss.item() < random_baseline * 2  # generous margin, still catches an 80x blowup
+
+
 def test_forward_pass_shapes_batch2_seq16_dmodel64_experts4_topk2():
     model = _model()
     input_ids = torch.randint(0, VOCAB_SIZE, (BATCH, SEQ_LEN))

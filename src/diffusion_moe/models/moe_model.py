@@ -4,6 +4,8 @@ benefit from diffusion routing, and which router type (Section 11 baselines)."""
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -137,6 +139,17 @@ class DiffusionMoETransformer(nn.Module):
         self.cosine_layers = cosine_set
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # nn.Embedding's default init is Normal(0, 1) -- std=1.0, dramatically
+        # too large for a transformer embedding table, and especially costly
+        # here since tie_embeddings=True by default makes this same
+        # oversized matrix double as the LM-head unembedding projection.
+        # This turned out to be the dominant contributor to the ~828 max
+        # abs logit / ~823 nats initial task_loss anomaly this whole
+        # investigation started from -- not residual-stream depth-compounding
+        # (see the scaled out_proj/down_proj init below, which fixed that
+        # part but left logits *unchanged* until this was also fixed).
+        # 0.02 is the standard GPT-2/nanoGPT convention.
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
 
         blocks: list[nn.Module] = []
         for layer_idx in range(n_layers):
@@ -182,6 +195,33 @@ class DiffusionMoETransformer(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
             self.lm_head.weight = self.token_embedding.weight
+
+        # Depth-aware residual-branch output scaling (GPT-2/nanoGPT
+        # convention, absent here until now): every residual sub-block's
+        # OUTPUT projection -- attention's out_proj, every FFN's down_proj
+        # (dense TransformerBlocks, every routed ExpertFFN, and the
+        # mandatory shared_expert alike) -- gets its default-initialized
+        # weight scaled down by 1/sqrt(2*n_layers). Without this, residual-
+        # stream variance compounds with depth; confirmed empirically on
+        # this exact 24-layer/every-layer-MoE config before this fix: random
+        # init produced logits with max abs ~828, matching almost exactly
+        # the ~823 nats initial task_loss it was causing (ln(vocab_size)=
+        # 10.4 is what a properly-calibrated random init should give). The
+        # "2" accounts for each block contributing two residual additions
+        # (attention, then FFN/MoE). Matched on the Linear's own attribute
+        # name (out_proj/down_proj) rather than its module class, since
+        # ExpertFFN is shared by routed and shared experts alike and
+        # TransformerBlock's FeedForward is a separate class entirely --
+        # this scopes to exactly the residual-branch outputs regardless of
+        # which of those it's nested in.
+        residual_output_scale = 1.0 / math.sqrt(2 * n_layers)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in (
+                "out_proj",
+                "down_proj",
+            ):
+                with torch.no_grad():
+                    module.weight.mul_(residual_output_scale)
 
     def forward(
         self,
