@@ -38,6 +38,7 @@ logits (batch, seq, vocab_size)
 - **`layers_to_replace`** (a `set[int]`, default = every layer index 0..n_layers-1): the only structural knob between "fully dense baseline" (`layers_to_replace=[]`), "fully diffusion-MoE" (the default), and the selective architecture Phase 1's oracle-ceiling result (`phase1_findings_report.md` §3.3) argues for — e.g. `[2, 4]` only, once wider evidence (the in-progress 32-layer sweep) confirms which layers actually warrant it.
 - **`router`** (str, default `"diffusion"`): selects which of the 4 MoE layer classes (§5) fills every replaced slot — `"diffusion" | "cosine" | "switch" | "random"`. Mixing router types across different layers of the same model isn't supported; it's one global choice per model instance.
 - **Forward pass returns three things**, not just logits: `(logits, activations, router_outputs)`. `activations[i]` is every layer's residual-stream output (dense or MoE alike). `router_outputs[i]` is present only for MoE layers — each variant's own aux dict, keyed by layer index — and is what `training/losses.py`'s `total_loss` consumes for the load-balance/separation penalties (§6).
+- **Initialization** (added in the all-layers training investigation, `phase2_training_report.md` §5, after this project's own model trained on a catastrophically mis-scaled loss for its entire history until this was found): `token_embedding.weight` is `Normal(0, 0.02)`, not `nn.Embedding`'s default `Normal(0, 1)` — matters more than usual since `tie_embeddings=True` by default makes it double as the LM-head projection. Every residual-branch output projection (attention's `out_proj`, every FFN's `down_proj` — dense, routed-expert, and shared-expert alike) is scaled by `1/sqrt(2 × n_layers)` after construction, the standard GPT-2/nanoGPT depth-aware convention. Sanity check: a fresh model's cross-entropy against random labels should land near `ln(vocab_size)`, not dramatically above it.
 
 ---
 
@@ -88,8 +89,12 @@ x  ────────────────────►  [1] NystromD
                           [4] dispatch_and_aggregate(ffn_norm(x), ...)  ◄───┘
                               → expert_out (batch, seq, d_model)
                                      │
+                          [4b] shared_expert(ffn_norm(x))  -- unconditional,
+                               no gate, entirely outside steps [1]-[4]
+                              → shared_out (batch, seq, d_model)
+                                     │
                                      ▼
-                          [5] output = x + expert_out   (residual add)
+                       [5] output = x + expert_out + shared_out  (residual add)
 ```
 
 **Per-stage detail:**
@@ -98,7 +103,8 @@ x  ────────────────────►  [1] NystromD
 2. **Scale normalization** — `landmark_scale` (mean pairwise landmark-to-landmark distance, `routing/separation.py`) rescales `Psi_t` and the centroids before anything sees them. **This step exists only because of a real bug** (`phase1_findings_report.md` §3.4): raw diffusion coordinates measured ≈1e-7 in magnitude on real Mistral-7B activations, several orders of magnitude too small for a fixed `tau=0.1` to produce anything but a numerically-uniform softmax — this rescaling is what makes `tau` operate in a consistent, dimensionless unit instead of each layer's own unpredictable raw coordinate scale.
 3. **Routing** (`routing/router.py::DiffusionRouter`) — `router_logits = -‖Psi_t - centroid_k‖²` for every expert `k` (expanded via the `‖a-b‖² = ‖a‖²-2a·b+‖b‖²` identity, no explicit token-by-token loop), tempered softmax by `tau`, then top-`k` selection with gate values renormalized to sum to 1 over just the selected experts.
 4. **Dispatch and aggregation** (`models/moe_dispatch.py::dispatch_and_aggregate`, shared by all 4 MoE variants) — tokens are gathered into contiguous per-expert buckets (`argsort` on flat expert assignment + `index_select`, so each expert runs once over its assigned tokens rather than once per token), each expert (`models/expert_ffn.py::ExpertFFN`, a SwiGLU sized to `ffn_dim // n_experts * overlap_factor`) processes its bucket, outputs are scattered back to original token order and weighted by gate value, and a token's (up to) `top_k` expert outputs are summed.
-5. **Residual add** back onto the pre-FFN residual stream `x` (which already includes the attention residual from step 0) — standard pre-norm block structure, just with the FFN sub-layer replaced.
+4b. **Mandatory shared expert** (`shared_expert`, same `ExpertFFN` class, same width/`overlap_factor` as a routed expert) — applied to every token, every step, entirely outside steps [1]-[4]: no gate value, no centroid, no participation in routing at all. Added in the all-layers training investigation (`phase2_training_report.md` §3) after finding that with every layer's FFN computation contingent on sparse routing, nothing in the network had guaranteed, routing-independent gradient signal — a pattern also used in production MoE architectures (DeepSeekMoE's "shared expert isolation"). Increases active compute per token from `top_k` experts to `top_k + 1`; not a reallocation of existing capacity.
+5. **Residual add** back onto the pre-FFN residual stream `x` (which already includes the attention residual from step 0): `output = x + expert_out + shared_out` — standard pre-norm block structure, just with the FFN sub-layer replaced by the routed-plus-shared sum.
 
 **Expert centroids** (`routing/centroids.py::ExpertCentroids`) are the one MoE-specific learned parameter beyond the experts themselves: `nn.Parameter` of shape `(n_experts, n_components)`, seeded via k-means++ on the *first* batch of diffusion coordinates the layer ever sees (`initialise_from_batch`, a one-time no-op after that), then trained like any other parameter — pulled toward nearby tokens by the routing softmax's gradient, pushed apart by `centroid_separation_loss` (§6). `clip_norm_()` is a post-optimizer-step safeguard (not part of the loss itself) capping each centroid's norm at a multiple of the current `landmark_scale`, added after a real training run found the separation loss has no upper bound on centroid growth by design and let centroids drift far enough outside the data's real range to collapse the router toward uniform dispatch (`phase1_findings_report.md` §3.4, bug 1).
 
@@ -130,7 +136,7 @@ loss = task_loss + mu * load_loss + nu * sep_loss
 - **`task_loss`** — standard causal-LM cross-entropy (`IGNORE_INDEX = -100` masking, matching `data/dataset.py::collate_fn`'s convention).
 - **`load_loss`** (`routing/load_balance.py::coefficient_of_variation_loss`) — squared coefficient of variation of each expert's *dense* (pre-top-k, untempered softmax of `router_logits`) average gating mass across the batch. 0 for a perfectly balanced router; its maximum is exactly `n_experts - 1` for total collapse onto one expert — this ceiling is what the pilot fine-tune's oscillation (`phase1_findings_report.md` §3.4) was measured hitting exactly. Computed identically across **all four** router variants (every variant's aux dict carries dense `router_logits`), so load-balance is directly comparable between them.
 - **`sep_loss`** (`routing/separation.py::centroid_separation_loss`) — negative mean pairwise distance between expert centroids in diffusion space, normalized by `landmark_scale`; only computed for layers whose aux dict carries `centroids`/`Psi_landmarks` (currently `DiffusionMoELayer` only — `CosineMoELayer`'s raw-space centroids aren't put through this loss). Both `load_loss` and `sep_loss` are averaged across every MoE layer present, and are exactly 0 for a fully dense model (empty `router_outputs`).
-- **`mu`, `nu`** — the two loss weights, `0.01`/`0.05` by default (`configs/base_config.yaml`'s `routing.mu_load`/`routing.nu_sep`). §7's tuning attempts (also `phase1_findings_report.md` §3.4) tested `mu` up to `0.3` without conclusively resolving load-balance oscillation at the one layer tested so far.
+- **`mu`, `nu`** — the two loss weights, `2.0`/`0.05` by default (`configs/base_config.yaml`'s `routing.mu_load`/`routing.nu_sep`). `mu_load` was `0.01` until `phase2_training_report.md` §6.2 measured `task_loss`'s actual gradient pull on the shared centroids parameter directly and found the old value left `load_loss` with an effective ~186x weighting disadvantage — not the ~30x range §7's earlier tuning attempts explored (also `phase1_findings_report.md` §3.4).
 
 ---
 
@@ -147,18 +153,19 @@ loss = task_loss + mu * load_loss + nu * sep_loss
 | `routing.n_landmarks` | 128 | Nystrom landmark count |
 | `routing.diffusion_t` | 3 | Diffusion-map low-pass sharpness |
 | `routing.alpha` | 1.0 | Coifman–Lafon degree-normalization exponent |
-| `routing.mu_load` | 0.01 | Load-balance loss weight |
+| `routing.mu_load` | 2.0 | Load-balance loss weight — see §6, measured not guessed |
 | `routing.nu_sep` | 0.05 | Separation loss weight |
 | `routing.centroid_refresh_steps` | 500 | Production default — the pilot used a much shorter 20 (and, in later tuning, 10,000) |
 | `routing.centroid_max_radius_factor` | 3.0 | Caps centroid norm at this multiple of `landmark_scale`, applied by `Trainer.train_step` after every optimizer step |
 | `routing.noise_std` | 0.0 (off) | Noisy top-k gating magnitude — see §6; scale relative to `tau`, not absolute (findings report §3.5) |
 | `training.lr` | 3.0e-4 | AdamW |
-| `training.total_tokens` | 30,000,000,000 | Full Phase 2 training budget (not run yet) |
+| `training.total_tokens` | 30,000,000,000 | Full Phase 2 budget; the all-layers investigation itself used a much smaller bounded budget (~20M tokens, `phase2_training_report.md`), not this default |
 | `training.precision` | bf16 | |
+| `training.keep_last_n_checkpoints` | 2 | Numbered checkpoints beyond the most recent N are pruned automatically after each save — `phase2_training_report.md` §4 |
 | `layers_to_replace` | `null` (= every layer) | See §2 |
 | `cosine_layers` | `null` (= none) | Per-layer `cosine` flag for the layers in `layers_to_replace` — see §4 stage 1 |
 
-**Two target model sizes** (`configs/model/300m.yaml`, `1.3b.yaml`) describe the project's *own* from-scratch architectures for eventual Phase 2 training — **neither has been run in this investigation**; every diagnostic and the pilot fine-tune instead used the pretrained `mistralai/Mistral-7B-v0.1` as a stand-in dense reference (`methodology.md` §1 explains why):
+**Two target model sizes** (`configs/model/300m.yaml`, `1.3b.yaml`) describe the project's *own* from-scratch architectures. Every diagnostic and the pilot fine-tune in Phase 1 used the pretrained `mistralai/Mistral-7B-v0.1` as a stand-in dense reference instead (`methodology.md` §1 explains why) — but the 300M config **has** now been trained end-to-end, all layers routed, in the all-layers investigation (`phase2_training_report.md`); the 1.3B config remains unrun:
 
 | | 300M config | 1.3B config |
 |---|---|---|

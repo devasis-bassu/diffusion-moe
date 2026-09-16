@@ -298,4 +298,37 @@ Not part of `total_loss`; logged directly by the pilot script's own training loo
 
 ### 5.5 `loss` — the actual optimization target
 
-`loss = task_loss + mu * load_loss + nu * sep_loss` (`total_loss`'s return value with `.backward()` called on it). `mu`/`nu` default to `0.01`/`0.05` (`routing.mu_load`/`routing.nu_sep`). Everything else in this section is diagnostic/logging output, detached from the graph before being reported — only this composite scalar actually drives gradients.
+`loss = task_loss + mu * load_loss + nu * sep_loss` (`total_loss`'s return value with `.backward()` called on it). `mu`/`nu` default to `2.0`/`0.05` (`routing.mu_load`/`routing.nu_sep`). Everything else in this section is diagnostic/logging output, detached from the graph before being reported — only this composite scalar actually drives gradients.
+
+`mu_load` was `0.01` until `phase2_training_report.md` §6.2: measured directly (not guessed) on a freshly, correctly-initialized model, `task_loss`'s raw gradient pull on the shared `ExpertCentroids` parameter is only ~1.86x `load_loss`'s raw pull — `mu_load=0.01` shrank that to an effective ~186x in `task_loss`'s favor, leaving `load_loss` almost no real ability to resist router collapse. `nu_sep` has not been measured the same way yet — see that report's appendix.
+
+## 6. All-Layers Training Run: Architecture and Infrastructure Additions
+
+Durable reference material for mechanisms added while training every layer of the project's own from-scratch architecture as `DiffusionMoELayer` — see `phase2_training_report.md` for the narrative (bugs found, evidence, run-by-run results). This section covers what the mechanisms *are*; that report covers *why* and *what happened*.
+
+### 6.1 `DiffusionMoELayer.shared_expert`
+
+Every token, every step, passes through one additional `ExpertFFN` (`shared_expert`) that is applied unconditionally — no gate value, no centroid, no participation in top-k selection, entirely outside the diffusion router. Architecturally identical to a routed expert (same `hidden_dim = ffn_dim // n_experts * overlap_factor`, same `overlap_factor`); the only difference is that it always fires. Adds real active compute per token (`top_k + 1` experts instead of `top_k`), not a reallocation of existing capacity. Precedented in production MoE architectures (DeepSeekMoE's "shared expert isolation," similarly Qwen2-MoE) as a way to give the network *some* routing-independent gradient signal, so common/generic computation isn't entirely contingent on that step's routing decisions.
+
+### 6.2 Nystrom kernel bandwidth: live refresh between refits
+
+`NystromDiffusionMap.transform(Z, _refresh_eps=True)` (the default for a standalone call — i.e. every non-refit training step) re-derives `eps_` (the kernel bandwidth) from the current batch's actual distance to the frozen landmarks, rather than reusing the value fixed at the last `fit()`. Reuses the distance matrix already computed for the Nyström kernel itself, so the marginal cost is one more `n_landmarks × n_landmarks` eigensolve (`_fit_landmark_spectrum`), not another k-means clustering pass. `fit_transform()`'s own internal `transform()` call passes `_refresh_eps=False`, since immediately after a fresh `fit()` there is no staleness to correct. An explicit `eps` override (used by `geometry/multiscale.py`'s dyadic sweep) disables the refresh entirely, preserved via the same `self.eps is None` gate `fit()` already used to decide whether to apply the median heuristic.
+
+Why this exists: a kernel bandwidth fit once and frozen between refits describes a snapshot of the embedding distribution that grows more stale the longer training runs — see `phase2_training_report.md` §2 for the NaN-divergence incident this was found to cause.
+
+### 6.3 Checkpoint retention
+
+`Trainer._prune_old_checkpoints()`, called after every numbered checkpoint save: deletes all but the most recent `training.keep_last_n_checkpoints` (default `2`) numbered checkpoints (`step_N.pt`). `best.pt` is a separate file, always kept regardless. `keep_last_n_checkpoints <= 0` disables pruning (unbounded retention, the old default behavior) as an opt-in.
+
+### 6.4 `scripts/expert_attribution.py`: Hydra CLI overrides
+
+`load_config(config_name, overrides)` now accepts leftover `key=value` arguments (via `argparse.parse_known_args`), the same convention `scripts/train.py` already supports — needed because `build_dataloaders(cfg)` otherwise always falls back to `base_config.yaml`'s own data defaults (`the_pile`, Hub streaming, `max_seq_len=2048`), which will not match whatever data config a given checkpoint was actually trained against. Example: `python scripts/expert_attribution.py --checkpoint checkpoints/step_300.pt data.dataset=wikitext data.local_data_files=[...] data.max_seq_len=512`.
+
+### 6.5 Model initialization
+
+`DiffusionMoETransformer.__init__` now explicitly initializes two things that previously relied on PyTorch's untouched defaults:
+
+- **`token_embedding.weight`**: `Normal(0, 0.02)` (was `nn.Embedding`'s default `Normal(0, 1)`). Matters more than usual here because `tie_embeddings=True` by default makes this same matrix double as the LM-head unembedding projection.
+- **Every residual-branch output projection** (attention's `out_proj`, every FFN's `down_proj` — dense `TransformerBlock`, routed `ExpertFFN`, and `shared_expert` alike): scaled by `1/sqrt(2 × n_layers)` after construction, matched by the Linear's own attribute name rather than by module class (so it applies uniformly regardless of which kind of block it's nested in). Standard GPT-2/nanoGPT convention, previously entirely absent from this model.
+
+Sanity check available as a reusable pattern, not just a one-off: cross-entropy of a fresh random-init model against random labels should land near `ln(vocab_size)` (this project's default: `ln(32000) ≈ 10.37`). A value dramatically higher (or, differently, exactly the cap value seen repeatedly at eval time) is a strong, cheap signal of an initialization-scale problem, checkable before spending any real training compute — see `phase2_training_report.md` §5 for the incident this check would have caught immediately.
