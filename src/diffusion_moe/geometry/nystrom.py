@@ -108,7 +108,18 @@ class NystromDiffusionMap:
 
         d_new = K_new.sum(axis=1)
         d_alpha_new = np.power(d_new, self.alpha)
-        K_alpha = K_new / (d_alpha_new[:, None] * self._d_alpha_landmarks[None, :])
+        # A point whose kernel mass to every landmark underflows to exactly 0
+        # (drifted entirely outside the landmarks' bandwidth -- observed in
+        # practice once training pushes embeddings far enough between refits)
+        # would otherwise give 0/0 = NaN here, silently, since this is a raw
+        # numpy division with no validation. Guarded the same way row_sums is
+        # guarded below: such a point gets kernel weight 0 to every landmark
+        # instead of NaN: P_new normalizes to zero rows too, so
+        # Psi_t for it is defined as the origin, i.e. maximal uncertainty
+        # about its diffusion coordinates. That's a reasonable fallback --
+        # this NaN is not.
+        d_alpha_new_safe = np.where(d_alpha_new == 0, 1.0, d_alpha_new)
+        K_alpha = K_new / (d_alpha_new_safe[:, None] * self._d_alpha_landmarks[None, :])
 
         row_sums = K_alpha.sum(axis=1, keepdims=True)
         row_sums = np.where(row_sums == 0, 1.0, row_sums)

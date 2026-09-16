@@ -179,6 +179,23 @@ class Trainer:
 
         for micro_batch in micro_batches:
             losses = self._forward_loss(micro_batch)
+
+            if not torch.isfinite(losses["loss"]):
+                # clip_grad_norm_ can't repair this: the norm of a NaN/Inf
+                # gradient is itself NaN/Inf, so the very next optimizer.step()
+                # would silently set every parameter to NaN -- permanently,
+                # since nothing downstream can recover from that. Abort loudly
+                # here, before backward(), instead of training on (and
+                # checkpointing) poisoned weights for however many steps until
+                # something else happens to crash outright.
+                detail = ", ".join(
+                    f"{k}={v.item():.6g}" for k, v in losses.items() if k != "loss"
+                )
+                raise FloatingPointError(
+                    f"Non-finite loss at step {self.step} "
+                    f"(loss={losses['loss'].item()}): {detail}"
+                )
+
             scaled_loss = losses["loss"] / n
 
             if self.use_scaler:

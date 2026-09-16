@@ -274,6 +274,54 @@ def test_moe_layer_produces_nonzero_aux_losses(tmp_path):
     assert metrics["load_loss"] != 0.0 or metrics["sep_loss"] != 0.0
 
 
+def test_train_step_raises_on_nonfinite_loss_before_touching_params(tmp_path, monkeypatch):
+    """Real incident: an all-layers training run silently trained on NaN
+    losses for ~40 steps (clip_grad_norm_ can't repair a NaN gradient --
+    it just propagates NaN to every parameter on the next optimizer.step())
+    before eventually crashing on an unrelated downstream KMeans call. Must
+    abort immediately, before backward()/optimizer.step(), so no NaN/Inf
+    ever reaches the weights."""
+    import pytest
+
+    t = _make_trainer(tmp_path, layers_to_replace=[])
+    before = {n: p.clone() for n, p in t.model.named_parameters()}
+
+    def _nan_forward_loss(batch):
+        return {
+            "loss": torch.tensor(float("nan")),
+            "task_loss": torch.tensor(float("nan")),
+            "load_loss": torch.tensor(0.0),
+            "sep_loss": torch.tensor(0.0),
+        }
+
+    monkeypatch.setattr(t, "_forward_loss", _nan_forward_loss)
+
+    with pytest.raises(FloatingPointError, match="Non-finite loss"):
+        t.train_step([next(iter(t.train_loader))])
+
+    assert t.step == 0
+    assert all(torch.equal(before[n], p) for n, p in t.model.named_parameters())
+
+
+def test_train_step_raises_on_infinite_loss(tmp_path, monkeypatch):
+    import pytest
+
+    t = _make_trainer(tmp_path, layers_to_replace=[])
+
+    def _inf_forward_loss(batch):
+        return {
+            "loss": torch.tensor(float("inf")),
+            "task_loss": torch.tensor(float("inf")),
+            "load_loss": torch.tensor(0.0),
+            "sep_loss": torch.tensor(0.0),
+        }
+
+    monkeypatch.setattr(t, "_forward_loss", _inf_forward_loss)
+
+    with pytest.raises(FloatingPointError, match="Non-finite loss"):
+        t.train_step([next(iter(t.train_loader))])
+
+
 def test_train_step_exposes_per_layer_load_loss_for_multiple_moe_layers(tmp_path):
     """With two DiffusionMoELayers active, train_step's returned metrics must
     break load_loss down per layer, not just the aggregate mean -- otherwise

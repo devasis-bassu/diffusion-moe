@@ -76,6 +76,26 @@ def test_eps_override_same_seed_reuses_same_landmarks():
     np.testing.assert_array_equal(ndm_a.landmarks_, ndm_b.landmarks_)
 
 
+def test_transform_point_far_outside_landmark_bandwidth_gives_finite_not_nan():
+    """Real bug found via an all-layers training run: a point that drifts far
+    enough from the fitted landmarks (plausible mid-training, once centroid
+    separation pressure has moved embeddings for several hundred steps since
+    the last landmark refit) gets exactly-zero kernel mass to every landmark
+    -- d_alpha_new underflows to 0.0, and the unguarded division at line ~111
+    used to produce 0/0 = NaN here, which then propagated into task_loss/
+    load_loss and, a few steps later, poisoned every model parameter via
+    clip_grad_norm_'s inability to repair a NaN gradient. Regression test for
+    the d_alpha_new_safe guard."""
+    Z = _make_data(n=200)
+    ndm = NystromDiffusionMap(n_landmarks=32, n_components=10, t=3, alpha=1.0, random_state=0)
+    ndm.fit(Z)
+
+    far_point = np.full((1, 5), 1e8)
+    Psi_far = ndm.transform(far_point)
+
+    assert np.all(np.isfinite(Psi_far))
+
+
 def test_eigenvalues_decrease_diffusion_time_shrinks_coordinates():
     Z = _make_data(n=150)
     ndm_t1 = NystromDiffusionMap(n_landmarks=40, n_components=5, t=1, alpha=1.0, random_state=0)
