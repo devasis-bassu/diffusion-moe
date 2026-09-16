@@ -41,7 +41,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIGS_DIR = REPO_ROOT / "configs"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    """Returns (known args, leftover Hydra-style key=value overrides) --
+    e.g. `data.dataset=wikitext data.local_data_files=[...]` -- since
+    build_dataloaders(cfg) otherwise always falls back to base_config.yaml's
+    defaults (the_pile, Hub streaming, max_seq_len=2048), which won't match
+    whatever data config a given checkpoint was actually trained against."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config-name", type=str, default="base_config")
@@ -59,12 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_token_count", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="results/expert_attribution")
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 
-def load_config(config_name: str) -> Any:
+def load_config(config_name: str, overrides: list[str] | None = None) -> Any:
     with initialize_config_dir(version_base=None, config_dir=str(CONFIGS_DIR)):
-        return compose(config_name=config_name)
+        return compose(config_name=config_name, overrides=overrides or [])
 
 
 def load_model_from_checkpoint(checkpoint_path: str, cfg: Any, device: str) -> torch.nn.Module:
@@ -157,9 +162,9 @@ def pool_per_expert_top_tokens(
 
 def main() -> None:
     load_env()
-    args = parse_args()
+    args, overrides = parse_args()
     torch.manual_seed(args.seed)
-    cfg = load_config(args.config_name)
+    cfg = load_config(args.config_name, overrides)
 
     model = load_model_from_checkpoint(args.checkpoint, cfg, args.device)
     tokenizer = TokenizerWrapper(cfg.data.tokenizer)
