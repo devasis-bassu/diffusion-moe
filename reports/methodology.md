@@ -69,7 +69,9 @@ Every diagnostic below is a real CLI script under `scripts/`, backed by tested, 
 
 **Measures per layer**: `r_star_post_attention`, `r_star_pre_attention`, `spectral_gap`, `top_eigenvalues`, Nyström approximation error vs. landmark count, `likely_disconnected` flag, and `pool_diagnostics` (`eps` — the fitted kernel bandwidth; `token_norm_max_to_median`; `duplicate_fraction`; `n_tokens`).
 
-**Key defaults**: `n_landmarks=128`, `n_components=32`, `diffusion_t=3`, `alpha=1.0`, `intrinsic_dim_threshold=0.95`, `max_pool_size=8192` tokens/layer, `n_sequences=1000`, `max_seq_len=512`, `batch_size=8`, `seed=42`, dataset default `wikipedia`.
+**Key defaults**: `n_landmarks=128`, `n_components=32`, `diffusion_t=3`, `alpha=1.0`, `intrinsic_dim_threshold=0.95`, `max_pool_size=8192` tokens/layer, `n_sequences=1000`, `max_seq_len=512`, `batch_size=8`, `seed=42`, dataset default `wikipedia` (now overridable via `--dataset`/`--local_data_files`, added for the same CDN-reliability reason as `StreamingTextDataset`'s `local_data_files` — see §4's infrastructure notes).
+
+**Also supports `--exclude_token_ids`** (default: none, so behavior is unchanged unless requested): drops matching tokens from geometry pooling entirely, via `activation_capture.py::collect_layer_activations`'s new `excluded_token_ids` parameter — see findings report §2.5.
 
 **Output**: `results/geometry/{model}_geometry.json`, `{model}_geometry.png`.
 
@@ -77,7 +79,7 @@ Every diagnostic below is a real CLI script under `scripts/`, backed by tested, 
 python scripts/extract_geometry.py --model mistralai/Mistral-7B-v0.1 --n_sequences 1000
 ```
 
-**Status: rerun at full defaults after the threshold/diagnostics fix, reproducing the original 4 disconnected layers and r\* statistics (mean 4.6, median 4.5, range 1–11)** — confirms the earlier partial-sample result wasn't a sampling artifact. See findings report §2.3.
+**Status: rerun at full defaults after the threshold/diagnostics fix, reproducing the original 4 disconnected layers and r\* statistics (mean 4.6, median 4.5, range 1–11)** — confirms the earlier partial-sample result wasn't a sampling artifact. See findings report §2.3. A separate 200-sequence/wikitext run comparing `--exclude_token_ids 13` (newline) against a baseline found the exclusion cleared both layers flagged disconnected in that run — findings report §2.5.
 
 ### 3.2 `scripts/multiscale_geometry.py` — dyadic bandwidth sweep
 
@@ -121,13 +123,15 @@ python scripts/ffn_specialization.py --model mistralai/Mistral-7B-v0.1 --dataset
 
 **Measures per layer**: position-based (`frac_at_position_0`, `frac_at_last_position`, `median_dist_from_start/end`, decoded text of top-`top_frac` outlier instances) and identity-based (`per_token_id_norm_summary` — mean/median/max norm per unique token id with ≥`min_token_id_count` occurrences; `delimiter_vs_content` — mean norm compared between delimiter-like and content token-id groups, via a tokenizer-agnostic "contains no alphanumeric characters" classifier).
 
-**Key defaults**: `top_frac=0.01`, `min_token_id_count=3`, `n_sequences=50`, `max_seq_len=256`, `layers=[1, 2, 4, 15, 31]`, dataset default `wikipedia`.
+**Key defaults**: `top_frac=0.01`, `min_token_id_count=3`, `n_sequences=50`, `max_seq_len=256`, `layers=[1, 2, 4, 15, 31]`, dataset default `wikipedia` (also supports `--local_data_files`, same reason as §3.1).
 
 **Output**: `results/geometry/{model}_sink_token_diagnostic.json`.
 
 ```bash
 python scripts/sink_token_diagnostic.py --model mistralai/Mistral-7B-v0.1 --dataset wikitext --n_sequences 50 --layers 1 2 4 15 31
 ```
+
+**Status: also run against `the_pile`** (`--dataset the_pile`, same layers) to test whether layer 31's wikitext-specific punctuation pattern (§4.2 of the findings report) generalizes — it doesn't (delimiter-class ratio 2.2× on wikitext vs. 1.15× on `the_pile`), while newline-token dominance does (still the single largest outlier by a wide margin on both). See findings report §4.4.
 
 ### 3.5 Underlying reusable library (`src/diffusion_moe/geometry/`)
 
