@@ -141,6 +141,28 @@ def test_local_data_files_threaded_to_both_train_and_val_datasets(monkeypatch):
     assert val_loader.dataset.local_data_files == ["/tmp/fake-train.parquet"]
 
 
+def test_local_data_files_materialized_as_plain_list_from_omegaconf(monkeypatch):
+    """Reproduces a real crash found by actually running scripts/train.py:
+    a plain Python list in a test config isn't representative of a real
+    Hydra config, where every value arrives wrapped as an omegaconf.ListConfig
+    -- datasets.load_dataset's internal path resolution silently mishandled
+    that type (a ConfigAttributeError several frames deep in urllib.parse,
+    nothing at the call site itself). The test above used a plain list and
+    passed even before the fix, which is exactly how this shipped in the
+    first place -- this one uses a real OmegaConf config to actually catch it.
+    """
+    from omegaconf import OmegaConf
+
+    _patch(monkeypatch)
+    cfg = OmegaConf.create(_make_config(local_data_files=["/tmp/fake-train.parquet"]))
+    assert type(cfg.data.local_data_files).__name__ == "ListConfig"  # sanity: real repro condition
+
+    train_loader, _ = build_dataloaders(cfg)
+
+    assert train_loader.dataset.local_data_files == ["/tmp/fake-train.parquet"]
+    assert isinstance(train_loader.dataset.local_data_files, list)
+
+
 def test_local_data_files_defaults_to_none(monkeypatch):
     _patch(monkeypatch)
     train_loader, _ = build_dataloaders(_make_config())

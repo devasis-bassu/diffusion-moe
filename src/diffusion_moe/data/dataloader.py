@@ -38,8 +38,15 @@ def build_dataloaders(config: Any) -> tuple[DataLoader, DataLoader]:
     # See StreamingTextDataset's own docstring: bypasses Hub streaming (a
     # recurring flaky-CDN stall hit repeatedly across this investigation) by
     # reading already-downloaded local parquet files directly. None by
-    # default, so behavior is unchanged unless explicitly set.
-    local_data_files = _get(data_cfg, "local_data_files", None)
+    # default, so behavior is unchanged unless explicitly set. Hydra config
+    # values come through as omegaconf.ListConfig, not a plain list --
+    # datasets.load_dataset's internal path resolution silently mishandles
+    # that type (found by actually running this through scripts/train.py:
+    # a real ConfigAttributeError several frames deep in urllib.parse, not
+    # an obvious error at the call site itself), so materialize a plain
+    # list here at the boundary instead of passing the config object through.
+    raw_local_data_files = _get(data_cfg, "local_data_files", None)
+    local_data_files = list(raw_local_data_files) if raw_local_data_files else None
 
     tokenizer = TokenizerWrapper(tokenizer_name)
     collate = partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
