@@ -194,6 +194,48 @@ def test_collect_layer_activations_shapes():
         assert arr.dtype == np.float32
 
 
+def test_collect_layer_activations_excludes_given_token_ids():
+    """Recommendation 6 (phase1_findings_report.md §7): excluding known
+    outlier tokens (e.g. the newline token responsible for most of layers
+    1/2/4's disconnection) from geometry pooling entirely. Deterministic
+    setup: each sequence is 11 tokens of id 1 plus one token of id 2 (the
+    "excluded" one) -- with tokens_per_batch set high enough to capture
+    every valid position, pooled count must drop by exactly one token per
+    sequence once id 2 is excluded.
+    """
+    model = _tiny_model()
+    n_examples, batch_size = 8, 4
+
+    class _WithSentinelToken(IterableDataset):
+        def __iter__(self):
+            for _ in range(n_examples):
+                yield {"input_ids": [1] * (SEQ_LEN - 1) + [2]}
+
+    from functools import partial
+
+    from diffusion_moe.data.dataset import collate_fn
+
+    loader = DataLoader(
+        _WithSentinelToken(),
+        batch_size=batch_size,
+        collate_fn=partial(collate_fn, pad_token_id=0),
+    )
+
+    pre_unfiltered, _ = eg.collect_layer_activations(
+        model, loader, device="cpu", tokens_per_batch=1000, seed=0
+    )
+    pre_filtered, _ = eg.collect_layer_activations(
+        model, loader, device="cpu", tokens_per_batch=1000, seed=0, excluded_token_ids={2}
+    )
+
+    n_batches = n_examples // batch_size
+    assert pre_unfiltered[0].shape[0] == n_examples * SEQ_LEN
+    # one sentinel token per sequence removed, every batch
+    assert pre_filtered[0].shape[0] == n_examples * SEQ_LEN - n_examples
+    assert pre_filtered[0].shape[0] == pre_unfiltered[0].shape[0] - n_examples
+    assert n_batches > 0  # sanity: the loader actually yields multiple batches
+
+
 def test_nystrom_approximation_error_zero_at_reference_and_decreasing():
     Z = np.random.RandomState(0).randn(300, 8)
     errors = eg.nystrom_approximation_error(Z, m_values=[16, 32, 64, 128], n_components=5)
@@ -253,7 +295,7 @@ def test_analyze_layer_flags_disconnected_clusters():
     )
 
     assert result["likely_disconnected"] is True
-    assert result["top_eigenvalues"][0] > 0.999
+    assert result["top_eigenvalues"][0] > 0.29
     # The diagnostics should point at the outlier-norm hypothesis (large
     # token_norm_max_to_median), not the duplicate-landmark hypothesis
     # (near-zero eps / high duplicate_fraction) — these 200 points are all

@@ -99,6 +99,7 @@ def collect_layer_activations(
     device: str,
     tokens_per_batch: int,
     seed: int,
+    excluded_token_ids: set[int] | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Runs the model over every batch in `loader`, subsampling
     `tokens_per_batch` valid tokens per batch at every layer, and pools them
@@ -108,6 +109,13 @@ def collect_layer_activations(
     `tokens_per_batch` should be derived from a total per-layer budget via
     compute_tokens_per_batch, not passed as a large fixed constant — see that
     function's docstring for why a fixed per-batch quota doesn't scale.
+
+    `excluded_token_ids`: token ids to drop from the pool entirely before
+    subsampling, e.g. the newline token responsible for most of the
+    kernel-disconnection pathology at layers 1/2/4 (phase1_findings_report.md
+    §4, recommendation 6) — a cheap, complementary mitigation to the
+    cosine-normalization fix, worth testing on its own since it doesn't
+    require changing the production routing metric.
     """
     generator = torch.Generator().manual_seed(seed)
     pre_pool: list[list[torch.Tensor]] = None
@@ -132,6 +140,12 @@ def collect_layer_activations(
             # across every layer's pre/post tensors for a like-for-like
             # pre-vs-post-attention comparison at the same tokens
             flat_mask = attention_mask.reshape(-1).bool()
+            if excluded_token_ids:
+                flat_ids = input_ids.reshape(-1)
+                excluded = torch.zeros_like(flat_mask)
+                for token_id in excluded_token_ids:
+                    excluded |= flat_ids == token_id
+                flat_mask = flat_mask & ~excluded
             n_valid = int(flat_mask.sum().item())
             n = min(tokens_per_batch, n_valid)
             sample_idx = torch.randperm(n_valid, generator=generator)[:n]

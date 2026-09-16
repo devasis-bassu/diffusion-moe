@@ -75,6 +75,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_token_id_count", type=int, default=MIN_TOKEN_ID_COUNT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="results/geometry")
+    parser.add_argument(
+        "--local_data_files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Local parquet file path(s) to read --dataset's train split from directly, "
+        "bypassing Hub streaming -- see StreamingTextDataset's local_data_files docstring.",
+    )
     return parser.parse_args()
 
 
@@ -145,7 +153,7 @@ def main() -> None:
     tokenizer = TokenizerWrapper(args.model)
     dataset = StreamingTextDataset(
         args.dataset, tokenizer, max_seq_len=args.max_seq_len, take=args.n_sequences,
-        seed=args.seed,
+        seed=args.seed, local_data_files=args.local_data_files,
     )
     loader = DataLoader(
         dataset,

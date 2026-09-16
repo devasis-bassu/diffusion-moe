@@ -81,6 +81,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="results/geometry")
+    parser.add_argument("--dataset", type=str, default="wikipedia")
+    parser.add_argument(
+        "--local_data_files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Local parquet file path(s) to read --dataset's train split from directly, "
+        "bypassing Hub streaming -- see StreamingTextDataset's local_data_files docstring "
+        "for why this exists (a recurring flaky-CDN stall, hit on two different datasets "
+        "across this investigation).",
+    )
+    parser.add_argument(
+        "--exclude_token_ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Token ids to drop from geometry pooling entirely (recommendation 6 in "
+        "phase1_findings_report.md) — e.g. the newline token (id 13 for Mistral-7B's "
+        "tokenizer) responsible for most of the kernel-disconnection pathology at "
+        "layers 1/2/4. Not specified by default, so behavior is unchanged unless "
+        "explicitly requested.",
+    )
     return parser.parse_args()
 
 
@@ -236,12 +258,13 @@ def run_geometry_extraction(
     d_model: int,
     tokens_per_batch: int = 512,
     seed: int = 42,
+    excluded_token_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline over an already-constructed model/loader. Kept separate
     from main() so tests can drive it with a tiny local model and a mocked
     data stream, without any network access."""
     pre_arrays, post_arrays = collect_layer_activations(
-        model, loader, device, tokens_per_batch, seed
+        model, loader, device, tokens_per_batch, seed, excluded_token_ids=excluded_token_ids
     )
 
     layers = []
@@ -321,7 +344,12 @@ def main() -> None:
 
     tokenizer = TokenizerWrapper(args.model)
     dataset = StreamingTextDataset(
-        "wikipedia", tokenizer, max_seq_len=args.max_seq_len, take=args.n_sequences, seed=args.seed
+        args.dataset,
+        tokenizer,
+        max_seq_len=args.max_seq_len,
+        take=args.n_sequences,
+        seed=args.seed,
+        local_data_files=args.local_data_files,
     )
     loader = DataLoader(
         dataset,
@@ -333,11 +361,20 @@ def main() -> None:
     tokens_per_batch = compute_tokens_per_batch(
         args.max_pool_size, args.n_sequences, args.batch_size
     )
+    excluded_token_ids = set(args.exclude_token_ids) if args.exclude_token_ids else None
     results = run_geometry_extraction(
-        model, loader, args.device, d_model, tokens_per_batch=tokens_per_batch, seed=args.seed
+        model,
+        loader,
+        args.device,
+        d_model,
+        tokens_per_batch=tokens_per_batch,
+        seed=args.seed,
+        excluded_token_ids=excluded_token_ids,
     )
+    results["excluded_token_ids"] = sorted(excluded_token_ids) if excluded_token_ids else []
     results["model_name"] = args.model
     results["n_sequences"] = args.n_sequences
+    results["dataset"] = args.dataset
 
     output_dir = Path(args.output_dir)
     json_path = save_results(results, output_dir, args.model)
