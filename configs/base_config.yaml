@@ -24,7 +24,16 @@ routing:
   n_landmarks: 128
   diffusion_t: 3
   alpha: 1.0
-  mu_load: 0.01
+  # Measured directly, not guessed: on a freshly (correctly) initialized
+  # model, task_loss's raw gradient pull on the shared ExpertCentroids
+  # parameter is only ~1.86x load_loss's raw pull -- a fair fight. The old
+  # mu_load=0.01 shrank that to an effective ~186x, leaving load_loss
+  # almost no ability to resist collapse -- very likely tuned against the
+  # old, catastrophically-mis-scaled task_loss (see moe_model.py's
+  # embedding/residual-init fix) and never revisited once that was fixed.
+  # 2.0 targets an effective ratio near 1 (roughly balanced pull), not
+  # load_loss dominating outright.
+  mu_load: 2.0
   nu_sep: 0.05
   centroid_refresh_steps: 500
   centroid_max_radius_factor: 3.0
