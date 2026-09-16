@@ -27,6 +27,26 @@ class DiffusionMoELayer(nn.Module):
     (landmarks/eigensystem are re-fit every `centroid_refresh_steps` calls and
     reused via Nystrom extension in between, since re-fitting is the expensive
     step), then routed to the nearest expert centroids in that space.
+
+    In addition to the n_experts routed experts, every token also passes
+    through one mandatory shared_expert that sits entirely outside the
+    router -- no gate value, no centroid, unconditionally applied every
+    step regardless of what the diffusion router decides. Motivated by a
+    real observation from the all-layers training run (see
+    phase1_findings_report.md): with every layer routed, 23 of 24 layers
+    showed real (if partial) load imbalance simultaneously, and task_loss
+    plateaued well above where a comparably-sized dense model should land.
+    Precedented in production MoE architectures (DeepSeekMoE's "shared
+    expert isolation", similarly in Qwen2-MoE) for exactly this reason: a
+    purely sparsely-routed layer has no path guaranteed consistent gradient
+    signal every step, since everything is contingent on routing decisions
+    -- common/generic computation ends up redundantly relearned by whichever
+    expert wins the routing lottery that step, or not learned reliably at
+    all if routing is noisy. The shared expert is architecturally identical
+    to a routed ExpertFFN (same width, same overlap_factor) -- it's the
+    *unconditional* application, not a different architecture, that makes
+    it "shared". This does add real active compute per token (top_k+1
+    experts fire instead of top_k), not a reallocation of existing capacity.
     """
 
     def __init__(
@@ -92,6 +112,10 @@ class DiffusionMoELayer(nn.Module):
                 for _ in range(n_experts)
             ]
         )
+        # Same width/overlap_factor as a routed expert -- see the class
+        # docstring for why this exists and why "shared" means unconditional
+        # application, not a different architecture.
+        self.shared_expert = ExpertFFN(d_model, ffn_dim, n_experts, overlap_factor=overlap_factor)
 
         self.register_buffer("_step", torch.tensor(0, dtype=torch.long))
 
@@ -171,7 +195,10 @@ class DiffusionMoELayer(nn.Module):
 
         ffn_input = self.ffn_norm(x)
         expert_out = self._dispatch_and_aggregate(ffn_input, gate_values, expert_indices)
-        output = x + expert_out
+        # Unconditional: every token, every step, no gate value -- entirely
+        # outside the router's influence (see class docstring).
+        shared_out = self.shared_expert(ffn_input)
+        output = x + expert_out + shared_out
 
         aux = {
             "router_logits": router_logits,

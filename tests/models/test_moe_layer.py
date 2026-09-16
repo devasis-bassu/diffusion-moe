@@ -85,16 +85,53 @@ def test_cosine_true_fits_on_l2_normalized_activations():
     discriminator between "fit on raw activations" and "fit on normalized
     ones" without needing to inspect intermediate arrays directly.
     """
+    torch.manual_seed(0)  # was unseeded -- flaky, see below
     x, positions = _inputs()
 
     raw_layer = _make_layer(cosine=False)
     raw_layer(x, positions)
-    assert raw_layer.ndm.landmarks_.max(axis=-1).max() > 1.0  # some coordinate exceeds 1
+    # Norm, not a single coordinate's raw value: landmarks are k-means
+    # centroids (means of assigned points), and averaging shrinks individual
+    # coordinate magnitude -- a max-single-coordinate proxy can dip under 1.0
+    # even for unnormalized ~N(0,1)^64 points (observed flakily in practice,
+    # unseeded, across separate runs: 0.775, then 0.862). Norm is the
+    # quantity the docstring's own triangle-inequality reasoning is actually
+    # about, and survives averaging with much more headroom (expectation
+    # sqrt(64) = 8, vs. the cosine layer's hard <= 1.0 cap below).
+    raw_norms = (raw_layer.ndm.landmarks_**2).sum(axis=-1) ** 0.5
+    assert raw_norms.max() > 1.0
 
     cosine_layer = _make_layer(cosine=True)
     cosine_layer(x, positions)
     landmark_norms = (cosine_layer.ndm.landmarks_**2).sum(axis=-1) ** 0.5
     assert (landmark_norms <= 1.0 + 1e-6).all()
+
+
+def test_shared_expert_exists_with_same_width_as_a_routed_expert():
+    layer = _make_layer()
+    assert hasattr(layer, "shared_expert")
+    assert layer.shared_expert.hidden_dim == layer.experts[0].hidden_dim
+
+
+def test_shared_expert_contributes_even_when_routing_contributes_nothing():
+    """The actual property that makes it "mandatory" / "outside the router's
+    influence": output must still differ from the plain residual x even if
+    dispatch_and_aggregate (the routed path) contributes exactly zero --
+    i.e. the shared expert's contribution cannot be routing-contingent."""
+    layer = _make_layer()
+    x, positions = _inputs()
+
+    original_dispatch = layer._dispatch_and_aggregate
+    layer._dispatch_and_aggregate = lambda *args, **kwargs: torch.zeros_like(x)
+    try:
+        out, _ = layer(x, positions)
+    finally:
+        layer._dispatch_and_aggregate = original_dispatch
+
+    # out = x + z (attn residual) + 0 (routed path) + shared_expert(...):
+    # must differ from x + z alone, i.e. the shared expert really fired.
+    z = layer.attn(layer.attn_norm(x), positions, None)
+    assert not torch.allclose(out, x + z)
 
 
 def test_refresh_schedule_triggers_refit_every_n_steps():
