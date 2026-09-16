@@ -260,3 +260,42 @@ A tiny model (for speed, not to avoid anything) at real defaults otherwise — c
 **Fixed**: `.float()` before `.numpy()` in `moe_layer.py` and `centroids.py`; `.float()` before `torch.cdist` in `separation.py` (both call sites — `landmark_scale` and `centroid_separation_loss`). All differentiable, no effect on gradient flow. Confirmed with a direct bf16 forward+backward test (`tests/models/test_moe_layer.py::test_forward_and_backward_work_under_real_bf16_mixed_precision`) and by rerunning the command above to completion: 8 clean steps, `load_loss`/`sep_loss` finite and non-degenerate throughout.
 
 **A fourth gap, unrelated to dtype**: `ExpertCentroids.clip_norm_()` (§4.4, bug 1's fix) was never called anywhere in `Trainer` — the pilot script's own training loop was its only caller in the entire codebase. Fixed by calling it from `Trainer.train_step()` after every optimizer step, for every block exposing both `centroids` and `ndm` attributes (`getattr`-guarded, so dense `TransformerBlock`s and the non-diffusion router variants are unaffected). `centroid_max_radius_factor` is now a `Trainer` config field (`routing.centroid_max_radius_factor`, default `3.0`, matching the pilot script's own default) rather than pilot-specific. Tested by deliberately inflating a centroid to 1000x its layer's scale mid-training and confirming one real `train_step` brings it back within bounds (`test_train_step_clips_centroid_norms_after_optimizer_step`) — the reproduction test in `test_centroids.py` already proves `clip_norm_` itself works; this one proves `Trainer` actually calls it.
+
+---
+
+## 5. Training Metrics Reference
+
+Every metric logged during a real training run (`Trainer`, `pilot_finetune.py`, or both), what it's actually computing, and how to read it. All are also covered by `tests/training/test_losses.py` and `tests/training/test_trainer.py`.
+
+### 5.1 `task_loss`
+
+Standard causal-LM cross-entropy (`training/losses.py::total_loss`), computed over every non-padded position (`IGNORE_INDEX = -100` masking matches `collate_fn`'s shifted-label convention). This is the metric that actually matters for model quality — `load_loss`/`sep_loss` below exist only to shape *how* routing behaves, not to directly improve prediction. Reported in nats (natural-log cross-entropy), not bits or perplexity; `evaluate.py`/`Trainer.evaluate()` separately reports validation perplexity (`exp(nll)`, capped at `exp(20)` to avoid `inf` on a garbage model).
+
+### 5.2 `load_loss` — `routing/load_balance.py::coefficient_of_variation_loss`
+
+The squared coefficient of variation (`(std/mean)²`) of each expert's average share of the *dense* (untempered, pre-top-k) softmax gate mass across a batch. Concretely: `load = softmax(router_logits).reshape(-1, n_experts).mean(dim=0)`, then `load_loss = (load.std() / load.mean())²`.
+
+- **`0.0`** — perfectly balanced: every expert receives, on average, exactly `1/n_experts` of the gate mass.
+- **`n_experts - 1`** (its exact maximum — `7.0` at the project's default `n_experts=8`) — total collapse: all gate mass concentrated on a single expert. This value has been observed exactly, repeatedly, in real training runs (§4.5) — it's not a theoretical edge case.
+- Computed identically across **all four** router variants (`DiffusionMoELayer`, `CosineMoELayer`, `SwitchMoELayer`, `RandomMoELayer`), since every variant's aux dict carries dense `router_logits` — directly comparable between them.
+- **Per-layer breakdown**: `total_loss` also returns `load_loss/layer_{idx}` for every MoE layer present (added specifically because the aggregate mean hides exactly what's needed to answer "did *this* layer's router collapse, independent of what every other layer did" — see findings report §3.6/the "what happens if a layer keeps forcing a single expert" discussion). The top-level `load_loss` is the mean of these per-layer values.
+
+### 5.3 `sep_loss` — `routing/separation.py::centroid_separation_loss`
+
+Negative mean pairwise Euclidean distance between expert centroids, in `landmark_scale`-normalized diffusion coordinates (so the value is comparable across layers and training progress rather than growing with raw centroid distance — see `landmark_scale`'s own docstring for why the guarding epsilon is `1e-30`, not the more conventional `1e-8`). Minimizing this loss pushes centroids apart, encouraging distinct experts to specialize on distinct regions of diffusion space.
+
+- **More negative = centroids more spread apart.** There is **no lower bound** on this loss by design (`test_more_spread_centroids_give_more_negative_loss` confirms this is intentional, not a bug) — nothing in the loss itself stops centroids drifting arbitrarily far outside the data's real coordinate range, which is exactly what happened in the first real pilot run (`sep_loss` grew from `-3` to `-19,185` over 300 steps) before `ExpertCentroids.clip_norm_()` was added as an external safeguard (§4.4).
+- **Only computed for layers whose aux dict carries both `centroids` and `Psi_landmarks`** — currently `DiffusionMoELayer` only (`CosineMoELayer`'s centroids live in raw `d_model` space, not diffusion coordinates, so this loss doesn't apply to them). `0.0` if no layer has both keys (e.g. a fully dense model, or a run using only baseline router variants).
+- **Per-layer breakdown**: same pattern as `load_loss` — `total_loss` returns `sep_loss/layer_{idx}` per applicable layer; the top-level `sep_loss` is their mean.
+
+### 5.4 `centroid_norm_mean`, `per_expert_load`, `argmax_expert` — `pilot_finetune.py` only
+
+Not part of `total_loss`; logged directly by the pilot script's own training loop (not currently mirrored in `Trainer`, since they were added for interactive debugging of one layer at a time, not general production logging):
+
+- **`centroid_norm_mean`** — mean L2 norm of the layer's `n_experts` centroids, post-`clip_norm_`. A sanity check that the norm-capping safeguard is actually holding (should stay near, not above, `centroid_max_radius_factor × landmark_scale`).
+- **`per_expert_load`** — the same dense softmax mean as `load_loss` computes, but returned as the full `(n_experts,)` vector rather than reduced to one scalar. This is what actually let the seed-dependence finding happen (§3.5): `load_loss` alone would show "collapsed" in both the seed-42 and seed-123 pilot runs identically, but only the full vector reveals collapse landed on a *different* expert each time.
+- **`argmax_expert`** — `per_expert_load.argmax()`, the single most-favored expert that step. The cheap summary of `per_expert_load` used for the "which expert wins 83% of steps" style analysis throughout §3.5.
+
+### 5.5 `loss` — the actual optimization target
+
+`loss = task_loss + mu * load_loss + nu * sep_loss` (`total_loss`'s return value with `.backward()` called on it). `mu`/`nu` default to `0.01`/`0.05` (`routing.mu_load`/`routing.nu_sep`). Everything else in this section is diagnostic/logging output, detached from the graph before being reported — only this composite scalar actually drives gradients.
