@@ -103,6 +103,32 @@ def test_build_model_from_config_matches_cfg_dims():
     assert len(model.blocks) == 2
 
 
+def test_run_seed_makes_model_init_reproducible(tmp_path, monkeypatch):
+    """Real gap this fixes: cfg.seed was never applied to torch's global RNG
+    anywhere in this pipeline (only data.seed, controlling shuffle order,
+    was wired through) -- model weight init, the dominant source of run-to-
+    run variation, drew from whatever unseeded state the process happened
+    to start in. Same cfg.seed, same init; different cfg.seed, different
+    init."""
+    monkeypatch.setattr(train_script, "build_dataloaders", _fake_build_dataloaders)
+    monkeypatch.chdir(tmp_path)
+
+    cfg_a = _tiny_cfg(seed=123)
+    trainer_a = train_script.run(cfg_a)
+    first_param_a = next(trainer_a.model.parameters()).clone()
+
+    cfg_b = _tiny_cfg(seed=123)
+    trainer_b = train_script.run(cfg_b)
+    first_param_b = next(trainer_b.model.parameters()).clone()
+
+    cfg_c = _tiny_cfg(seed=456)
+    trainer_c = train_script.run(cfg_c)
+    first_param_c = next(trainer_c.model.parameters()).clone()
+
+    assert torch.equal(first_param_a, first_param_b)  # same seed -> same init
+    assert not torch.equal(first_param_a, first_param_c)  # different seed -> different init
+
+
 def test_compute_total_steps():
     cfg = _tiny_cfg()
     # tokens_per_step = batch_size(4) * max_seq_len(8) * grad_accum_steps(1) = 32

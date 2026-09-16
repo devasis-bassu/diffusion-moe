@@ -13,7 +13,11 @@ DistributedDataParallel, launched with torchrun:
 
 from __future__ import annotations
 
+import random
+
 import hydra
+import numpy as np
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from diffusion_moe.data.dataloader import build_dataloaders
@@ -38,6 +42,22 @@ def run(cfg: DictConfig) -> Trainer:
     wraps the model in DistributedDataParallel itself; setup_distributed()
     here just makes sure the process group exists first.
     """
+    # cfg.seed was previously a no-op: nothing in this pipeline actually
+    # applied it to torch's global RNG (only data.seed, controlling shuffle
+    # order, was ever wired through). That meant model weight
+    # initialization -- the dominant source of run-to-run variation --
+    # drew from whatever unseeded state the process happened to start in,
+    # making "reproduce this run" impossible even with the same config.
+    # Seeded here, before model construction, so init is deterministic
+    # given the same cfg.seed. Does NOT (yet) cover NystromDiffusionMap's
+    # own k-means/eigensolve randomness, which has its own hardcoded
+    # random_state=42 independent of this -- a separate, smaller-scope gap.
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
     setup_distributed()
     try:
         model = build_model_from_config(cfg)
