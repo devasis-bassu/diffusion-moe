@@ -151,6 +151,74 @@ def test_resume_from_checkpoint_restores_step_and_weights(tmp_path):
         assert torch.equal(p1, p2)
 
 
+def test_resume_fast_forwards_past_already_consumed_batches(tmp_path):
+    """The actual bug this fixes: a freshly built train_loader always starts
+    its (deterministically ordered) stream from the beginning. Without
+    fast-forwarding, resuming from step 2 and calling train() would re-serve
+    batch 0 again -- data the original run already trained on -- instead of
+    continuing into batch 2 like an uninterrupted run would have reached by
+    then. _TinyLMDataset + a non-shuffling DataLoader give a fully
+    deterministic batch order (batch_size=4, so batch i = examples[4i:4i+4]),
+    making the exact expected batch checkable directly.
+    """
+    t = _make_trainer(tmp_path, layers_to_replace=[])
+    t.train(max_steps=2)  # consumes batches 0 and 1
+    t.save_checkpoint(t.checkpoint_dir / "manual.pt")
+
+    t2 = _make_trainer(tmp_path, layers_to_replace=[])
+    t2.load_checkpoint(t.checkpoint_dir / "manual.pt")
+    assert t2.step == 2
+
+    seen_batches = []
+    original_train_step = t2.train_step
+
+    def _spy(micro_batches):
+        seen_batches.append(micro_batches[0]["input_ids"].clone())
+        return original_train_step(micro_batches)
+
+    t2.train_step = _spy
+    t2.train(max_steps=3)  # should consume exactly batch 2 next, not batch 0
+
+    all_examples = list(_TinyLMDataset(n_examples=16, seed=0))
+    expected_batch_2_input_ids = torch.stack([ex["input_ids"] for ex in all_examples[8:12]])
+
+    assert len(seen_batches) == 1
+    assert torch.equal(seen_batches[0], expected_batch_2_input_ids)
+
+
+def test_resumed_training_actually_continues_past_the_checkpoint_step(tmp_path):
+    """The full round-trip the other resume test doesn't cover: not just that
+    a checkpoint restores step/weights correctly, but that calling train()
+    again afterward actually keeps training from there -- advancing the step
+    counter, updating parameters further, and resuming the LR schedule at
+    the right point (not restarting it) -- rather than train() silently
+    no-op'ing or erroring on a resumed trainer.
+    """
+    t = _make_trainer(tmp_path, layers_to_replace=[], training_overrides={"checkpoint_steps": 3})
+    t.train(max_steps=3)
+    weights_at_3 = {n: p.clone() for n, p in t.model.named_parameters()}
+
+    t2 = _make_trainer(tmp_path, layers_to_replace=[])
+    t2.load_checkpoint(t.checkpoint_dir / "step_3.pt")
+    assert t2.step == 3
+
+    t2.train(max_steps=6)
+
+    assert t2.step == 6
+    # parameters kept changing after resume, not frozen at the step-3 values
+    changed = any(
+        not torch.equal(weights_at_3[n], p) for n, p in t2.model.named_parameters()
+    )
+    assert changed
+    # scheduler resumed from step 3's LR trajectory, not restarted at step 0's
+    fresh_schedule_lr_at_6 = build_scheduler(
+        build_optimizer(t2.model, lr=1e-3, weight_decay=0.0), warmup_steps=0, total_steps=100
+    )
+    for _ in range(6):
+        fresh_schedule_lr_at_6.step()
+    assert t2.scheduler.get_last_lr() == fresh_schedule_lr_at_6.get_last_lr()
+
+
 def test_logs_to_stdout_when_wandb_not_configured(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     t = _make_trainer(tmp_path, layers_to_replace=[])

@@ -265,6 +265,23 @@ class Trainer:
         self.model.train()
         train_iter = iter(self.train_loader)
 
+        # Resuming from a checkpoint restores self.step, but a freshly built
+        # train_loader always starts its (deterministically shuffled, fixed
+        # seed) stream from the beginning -- without this, "resume" would
+        # silently re-serve the same batches the original run already
+        # trained on, rather than continuing into unseen data. Burn through
+        # exactly the micro-batches already consumed before resuming real
+        # training. Assumes grad_accum_steps (and the rest of the data
+        # config) matches what produced the checkpoint -- same requirement
+        # base_config.yaml already documents for layers_to_replace on
+        # resume, not a new constraint this introduces.
+        for _ in range(self.step * self.grad_accum_steps):
+            try:
+                next(train_iter)
+            except StopIteration:
+                train_iter = iter(self.train_loader)
+                next(train_iter)
+
         while self.step < max_steps:
             micro_batches = []
             for _ in range(self.grad_accum_steps):
