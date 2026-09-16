@@ -47,6 +47,13 @@ training:
   checkpoint_steps: 5000
   eval_steps: 1000
   log_steps: 50
+  # Numbered checkpoints (step_N.pt) beyond the most recent N are deleted
+  # automatically after each save -- otherwise they accumulate forever and
+  # can fill the disk mid-run (a real crash: 8 checkpoints x ~5.7GB each on
+  # a 60GB instance killed training right at its second-to-last step).
+  # best.pt is separate and always kept. <= 0 = unlimited retention (the
+  # old, unbounded behavior), opt-in.
+  keep_last_n_checkpoints: 2
 
 wandb:
   project: "diffusion-moe"

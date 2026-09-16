@@ -84,6 +84,13 @@ class Trainer:
         self.grad_accum_steps = _get(training_cfg, "grad_accum_steps", 1)
         self.grad_clip = _get(training_cfg, "grad_clip", 1.0)
         self.checkpoint_steps = _get(training_cfg, "checkpoint_steps", 5000)
+        # Numbered checkpoints (step_N.pt) accumulate forever otherwise --
+        # a real disk-full crash on an actual run (8 checkpoints x ~5.7GB
+        # each on a 60GB disk) killed training right at its second-to-last
+        # step. best.pt is exempt: it's not necessarily the most recent
+        # numbered one, and is small in count regardless (only overwritten
+        # when val_ppl actually improves).
+        self.keep_last_n_checkpoints = _get(training_cfg, "keep_last_n_checkpoints", 2)
         self.eval_steps = _get(training_cfg, "eval_steps", 1000)
         self.log_steps = _get(training_cfg, "log_steps", 50)
         self.precision = _get(training_cfg, "precision", "bf16")
@@ -270,6 +277,20 @@ class Trainer:
         }
         torch.save(state, path)
 
+    def _prune_old_checkpoints(self) -> None:
+        """Deletes numbered checkpoints (step_N.pt) beyond the most recent
+        keep_last_n_checkpoints, oldest first. best.pt is untouched -- it's
+        a separate file, not part of this numbered sequence. A no-op if
+        keep_last_n_checkpoints <= 0 (unlimited retention, opt-in)."""
+        if not is_main_process() or self.keep_last_n_checkpoints <= 0:
+            return
+        numbered = sorted(
+            self.checkpoint_dir.glob("step_*.pt"),
+            key=lambda p: int(p.stem.removeprefix("step_")),
+        )
+        for path in numbered[: -self.keep_last_n_checkpoints]:
+            path.unlink(missing_ok=True)
+
     def load_checkpoint(self, path: str | Path) -> None:
         state = torch.load(path, map_location=self.device, weights_only=False)
         self.raw_model.load_state_dict(state["model"])
@@ -324,3 +345,4 @@ class Trainer:
 
             if self.step % self.checkpoint_steps == 0:
                 self.save_checkpoint(self.checkpoint_dir / f"step_{self.step}.pt")
+                self._prune_old_checkpoints()

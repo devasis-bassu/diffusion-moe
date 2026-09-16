@@ -136,6 +136,46 @@ def test_train_creates_checkpoints_and_best_checkpoint(tmp_path):
     assert (t.checkpoint_dir / "step_5.pt").exists()
 
 
+def test_checkpoint_pruning_keeps_only_the_last_n_numbered_checkpoints(tmp_path):
+    """Real crash this fixes: numbered checkpoints (step_N.pt) accumulating
+    forever filled an actual instance's disk (8 checkpoints x ~5.7GB each
+    on a 60GB disk), killing training on the second-to-last checkpoint
+    save. checkpoint_steps=5, keep_last_n_checkpoints=2 over max_steps=20
+    -> checkpoints would be saved at 5, 10, 15, 20; only the last two
+    (15, 20) should survive."""
+    t = _make_trainer(
+        tmp_path, layers_to_replace=[],
+        training_overrides={"checkpoint_steps": 5, "keep_last_n_checkpoints": 2},
+    )
+    t.train(max_steps=20)
+
+    remaining = sorted(p.name for p in t.checkpoint_dir.glob("step_*.pt"))
+    assert remaining == ["step_15.pt", "step_20.pt"]
+
+
+def test_checkpoint_pruning_never_deletes_best(tmp_path):
+    t = _make_trainer(
+        tmp_path, layers_to_replace=[],
+        training_overrides={"checkpoint_steps": 5, "eval_steps": 5, "keep_last_n_checkpoints": 1},
+    )
+    t.train(max_steps=15)
+
+    assert (t.checkpoint_dir / "best.pt").exists()
+    remaining = sorted(p.name for p in t.checkpoint_dir.glob("step_*.pt"))
+    assert len(remaining) == 1  # pruned to just the most recent numbered one
+
+
+def test_keep_last_n_checkpoints_zero_disables_pruning(tmp_path):
+    t = _make_trainer(
+        tmp_path, layers_to_replace=[],
+        training_overrides={"checkpoint_steps": 5, "keep_last_n_checkpoints": 0},
+    )
+    t.train(max_steps=20)
+
+    remaining = sorted(p.name for p in t.checkpoint_dir.glob("step_*.pt"))
+    assert remaining == ["step_10.pt", "step_15.pt", "step_20.pt", "step_5.pt"]
+
+
 def test_resume_from_checkpoint_restores_step_and_weights(tmp_path):
     t = _make_trainer(tmp_path, layers_to_replace=[])
     t.train(max_steps=3)
