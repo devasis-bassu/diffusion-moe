@@ -8,7 +8,7 @@ from scipy.sparse.linalg import ArpackNoConvergence, eigs
 
 
 def diffusion_eigenvectors(
-    P: np.ndarray, n_components: int = 32
+    P: np.ndarray, n_components: int = 32, random_state: int | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """Top eigenvalues/eigenvectors of the Markov matrix P, sorted descending.
 
@@ -33,9 +33,19 @@ def diffusion_eigenvectors(
     n = P.shape[0]
     k = min(n_components, n - 2)
 
+    # ARPACK's Lanczos iteration starts from a random vector when v0 isn't
+    # given, so two calls on the *same* P can converge to a different (but
+    # equally valid, e.g. sign-flipped) eigenvector basis. Harmless when this
+    # only ran once per landmark set, but nystrom.py's transform() now reruns
+    # this every time its live eps_ refresh fires -- an unseeded v0 would
+    # make Psi_t's basis jitter step to step even without real drift in the
+    # data, which is exactly the routing instability this was meant to fix,
+    # not introduce. Fixing v0 removes that: identical P -> identical result.
+    v0 = np.random.RandomState(random_state).rand(n) if random_state is not None else None
+
     if k >= 1 and k < n - 1:
         try:
-            eigenvalues, eigenvectors = eigs(P, k=k, which="LM")
+            eigenvalues, eigenvectors = eigs(P, k=k, which="LM", v0=v0)
         except ArpackNoConvergence:
             eigenvalues, eigenvectors = dense_eig(P)
     else:

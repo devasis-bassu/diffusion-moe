@@ -360,16 +360,25 @@ def test_train_step_clips_centroid_norms_after_optimizer_step(tmp_path):
     t.train_step([next(iter(t.train_loader))])
 
     block = t.model.blocks[0]
-    scale = landmark_scale(
+    scale_before = landmark_scale(
         torch.from_numpy(block.ndm.psi_landmarks_).to(block.centroids.centroids.dtype)
     )
     with torch.no_grad():
         block.centroids.centroids[0] = torch.full_like(block.centroids.centroids[0], 1000.0)
-    assert block.centroids.centroids.norm(dim=-1).max() > 50 * scale  # sanity: really is huge
+    assert block.centroids.centroids.norm(dim=-1).max() > 50 * scale_before  # sanity: really is huge
 
     t.train_step([next(iter(t.train_loader))])
 
-    assert block.centroids.centroids.norm(dim=-1).max() <= t.centroid_max_radius_factor * scale * 1.5
+    # Recomputed fresh, not reused from before this step: this step's forward
+    # pass is a plain (non-refit) transform() call, and Option 1's eps_
+    # live-refresh means psi_landmarks_ -- and so landmark_scale -- can
+    # legitimately shift on every step now, not just at refit boundaries.
+    # What must hold is that clip_norm_ actually ran against whatever bound
+    # was in effect *during* this step, not against a stale one from before.
+    scale_after = landmark_scale(
+        torch.from_numpy(block.ndm.psi_landmarks_).to(block.centroids.centroids.dtype)
+    )
+    assert block.centroids.centroids.norm(dim=-1).max() <= t.centroid_max_radius_factor * scale_after * 1.5
 
 
 def test_dense_model_train_step_does_not_error_without_centroids(tmp_path):

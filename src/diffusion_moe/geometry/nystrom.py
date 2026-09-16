@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial.distance import cdist
 from sklearn.cluster import KMeans
 
 from diffusion_moe.geometry.eigensolver import diffusion_eigenvectors
-from diffusion_moe.geometry.kernel import (
-    bandwidth_median_heuristic,
-    gaussian_kernel,
-    gaussian_kernel_cross,
-)
+from diffusion_moe.geometry.kernel import bandwidth_median_heuristic, gaussian_kernel
 from diffusion_moe.geometry.markov import coifman_lafon_normalise
 
 
@@ -70,16 +67,39 @@ class NystromDiffusionMap:
         kmeans.fit(Z)
         self.landmarks_ = kmeans.cluster_centers_
 
-        self.eps_ = self.eps if self.eps is not None else bandwidth_median_heuristic(
-            self.landmarks_
-        )
+        eps = self.eps if self.eps is not None else bandwidth_median_heuristic(self.landmarks_)
+        self._fit_landmark_spectrum(eps)
+
+        return self
+
+    def _fit_landmark_spectrum(self, eps: float) -> None:
+        """(Re)derives everything that depends on the kernel bandwidth, given
+        the current (fixed) `self.landmarks_`: the landmark-landmark kernel
+        and Markov matrix, its eigendecomposition, and each landmark's own
+        direct (non-Nystrom) diffusion coordinates.
+
+        Called by fit() after a fresh k-means, and by transform()'s eps_
+        live-refresh (see there) to keep eigenvectors_/psi_landmarks_
+        consistent with whatever eps_ is currently in effect -- required for
+        Nystrom's defining correctness property (transform() applied to the
+        landmarks themselves must reproduce psi_landmarks_ exactly); reusing
+        stale eigenvectors_ computed from the *old* eps_ silently breaks that.
+        This is an eigensolve over an n_landmarks x n_landmarks matrix --
+        O(n_landmarks^3), negligible next to the O(n_landmarks) k-means
+        clustering over the full token batch that fit() alone does and this
+        does not repeat.
+        """
+        n_landmarks = self.landmarks_.shape[0]
+        self.eps_ = eps
         K = gaussian_kernel(self.landmarks_, self.eps_)
         P = coifman_lafon_normalise(K, alpha=self.alpha)
 
         # Solve for one extra eigenpair so we can drop the trivial top one
         # (eigenvalue ~1) and still return n_components informative directions.
         n_solve = min(self.n_components + 1, n_landmarks - 1)
-        eigenvalues, eigenvectors = diffusion_eigenvectors(P, n_components=n_solve)
+        eigenvalues, eigenvectors = diffusion_eigenvectors(
+            P, n_components=n_solve, random_state=self.random_state
+        )
 
         self.eigenvalues_ = eigenvalues[1:]
         self.eigenvectors_ = eigenvectors[:, 1:]
@@ -91,20 +111,58 @@ class NystromDiffusionMap:
         d_landmarks = K.sum(axis=1)
         self._d_alpha_landmarks = np.power(d_landmarks, self.alpha)
 
-        return self
-
-    def transform(self, Z: np.ndarray) -> np.ndarray:
+    def transform(self, Z: np.ndarray, _refresh_eps: bool = True) -> np.ndarray:
         """Extends diffusion coordinates to new points Z via the Nystrom formula.
 
         Returns Psi_t of shape (n, n_components), where
         Psi_t[:, i] = lambda_i^t * phi_i(Z) and phi_i is the Nystrom-extended
         i-th eigenfunction of the landmark Markov matrix.
+
+        `_refresh_eps` is internal (see fit_transform): a standalone call --
+        the real use case, e.g. models/moe_layer.py calling this on every
+        step *between* landmark refits -- lets eps_ track this batch's actual
+        distance to the (still-frozen) landmarks. fit_transform's own
+        internal call disables it, since it runs immediately after fit() on
+        the very same Z: there's no staleness yet to correct, and
+        refreshing anyway would silently override fit()'s landmark-based
+        heuristic with a different (batch-based) one for no benefit, plus
+        redundantly redo the eigensolve _fit_landmark_spectrum below.
         """
         if self.landmarks_ is None:
             raise RuntimeError("Call fit(Z) or fit_transform(Z) before transform().")
 
         Z = np.asarray(Z, dtype=np.float64)
-        K_new = gaussian_kernel_cross(Z, self.landmarks_, self.eps_)
+        sq_dists = cdist(Z, self.landmarks_, metric="sqeuclidean")
+
+        if _refresh_eps and self.eps is None:
+            # self.eps_ was set from the landmarks' own spread at the last
+            # fit() -- everything else about the landmarks/eigenvectors stays
+            # fixed until the next refit (expensive: k-means + eigensolve),
+            # but that leaves eps_ describing a distribution that's
+            # increasingly stale the longer training runs between refits.
+            # Re-deriving it here from *this batch's* actual distance to the
+            # (still-frozen) landmarks is cheap -- reuses sq_dists, already
+            # computed above for K_new -- and keeps the kernel bandwidth
+            # tracking real distributional drift instead of a step-0
+            # snapshot. This is what actually prevents the failure mode
+            # d_alpha_new_safe below merely papers over: a point drifting far
+            # enough, relative to a *stale* eps_, that every kernel value
+            # underflows to exactly 0.
+            #
+            # Must go through _fit_landmark_spectrum (not just eps_ and
+            # _d_alpha_landmarks in isolation): eigenvectors_/psi_landmarks_
+            # were computed from the *old* eps_ at fit() time, and Nystrom's
+            # correctness guarantee only holds when the landmark spectrum and
+            # the new-point extension share one consistent kernel. That's an
+            # eigensolve over an n_landmarks x n_landmarks matrix, not
+            # another k-means -- still cheap relative to the
+            # O(n_tokens * n_landmarks * d) cost already paid above for
+            # sq_dists.
+            eps_candidate = float(np.median(sq_dists))
+            eps = eps_candidate if eps_candidate > 0 else float(np.finfo(np.float64).eps)
+            self._fit_landmark_spectrum(eps)
+
+        K_new = np.exp(-sq_dists / self.eps_)
 
         d_new = K_new.sum(axis=1)
         d_alpha_new = np.power(d_new, self.alpha)
@@ -135,4 +193,4 @@ class NystromDiffusionMap:
 
     def fit_transform(self, Z: np.ndarray) -> np.ndarray:
         self.fit(Z)
-        return self.transform(Z)
+        return self.transform(Z, _refresh_eps=False)
