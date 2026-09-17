@@ -18,7 +18,7 @@ The honest answer is: six real, previously-undiscovered bugs, one badly-miscalib
 4. **Disk-full crash near the finish line** — unbounded checkpoint retention filled a 60GB instance's disk with ~5.7GB files, corrupting the final checkpoint write. Fixed with automatic pruning (§4).
 5. **A catastrophic initialization bug** — `task_loss` started at ~823 nats against a random-guessing baseline of `ln(32000)=10.37`, and never recovered below ~60 nats across any run, no matter how long training continued. Root-caused to two compounding, previously-unaddressed initialization gaps (no custom init existed anywhere in the model) and fixed; confirmed both in isolation and in a real training run (§5). This is the most consequential finding in this phase — everything observed in earlier runs (§6) was training on top of this bug.
 6. **`mu_load` (the load-balance loss weight) was miscalibrated by ~2 orders of magnitude** relative to `task_loss`'s gradient once the loss scale was actually correct — measured directly, not guessed, and retuned (§6.2).
-7. **`cfg.seed` was a no-op** — never applied to torch's global RNG anywhere in this pipeline (only `data.seed`, controlling shuffle order, was wired through), so model weight initialization — the dominant source of run-to-run variation — drew from whatever unseeded state the process happened to start in. Fixed, and what made the seed-repeat check in §6.5 meaningful in the first place (§8).
+7. **`cfg.seed` was a no-op** — never applied to torch's global RNG anywhere in this pipeline (only `data.seed`, controlling shuffle order, was wired through), so model weight initialization — the dominant source of run-to-run variation — drew from whatever unseeded state the process happened to start in. Fixed, and what made the seed-repeat check in §6.5 meaningful in the first place (§9).
 
 The final MoE run (`graceful-universe-21`) completed its full 2,441-step / 20M-token budget cleanly: zero NaN, `task_loss` ending at 7.08 (below the random baseline), all 24 layers' `load_loss` ending near zero (down from 7 of 24 near-total collapse mid-run), and `val_ppl` finally moving off its `exp(20)` safety cap for the first time in this investigation (7,286 → 5,081 → 35,294 spike → 16,158 → 3,245 → 2,239 → 974). That is real progress relative to every earlier run in this phase — but a same-budget **dense-model control run** (`peachy-cloud-22`, §6.4), run immediately afterward, decisively beat it: `task_loss=4.80`, `val_ppl=93.2`, in ~15x less wall-clock time. A second seed of both configs (§6.5) confirmed this wasn't one lucky/unlucky comparison — dense stayed essentially unchanged (sub-1% variance), while the MoE run got *worse* on the second seed (`val_ppl=1,478`, wall-clock 425 min) rather than better. Read together, this phase's honest bottom line is: the infrastructure now works, and the current all-layers diffusion-MoE configuration is decisively and consistently worse than the simple baseline it needs to beat. See §7.
 
@@ -158,7 +158,7 @@ The dense model wins decisively on every axis, at matched token budget. The time
 
 ### 6.5 Seed-repeat check: dense is consistent, diffusion-MoE is not
 
-Both §6.4 configs were rerun with `seed=123` (a new fix this phase: `cfg.seed` was previously never actually applied to torch's global RNG — only `data.seed`, controlling shuffle order, was wired through, meaning every prior run's model initialization was drawn from whatever unseeded state the process happened to start in, not a controlled value at all — see §8).
+Both §6.4 configs were rerun with `seed=123` (a new fix this phase: `cfg.seed` was previously never actually applied to torch's global RNG — only `data.seed`, controlling shuffle order, was wired through, meaning every prior run's model initialization was drawn from whatever unseeded state the process happened to start in, not a controlled value at all — see §9).
 
 | | seed=42 | seed=123 | Spread |
 |---|---|---|---|
@@ -230,21 +230,86 @@ Layer 0 is the only layer that stayed meaningfully balanced on *both* seeds at t
 
 ---
 
-## 8. Code Changes Summary
+## 8. Selective-Layer Results, the Refit-Discontinuity Investigation, and a Structural Alternative
+
+Following §7's revised recommendation, this section covers what actually running §6.7's data-driven layer candidates showed, a real bug found while investigating why the routed layer wasn't recovering as expected, a deeper structural finding about *why* the recovery is incomplete even with that bug fixed, and the resulting decision to test a structurally different router as the next comparison.
+
+### 8.1 Selective-layer results
+
+Both of §6.7's candidates were run at the same 20M-token budget, `seed=42`, with the fixed initialization:
+
+| Config | `task_loss` | `val_ppl` | Wall-clock |
+|---|---|---|---|
+| Dense | 4.80 | 93.2 | 20.1 min |
+| **Selective `[0]`** (`polar-leaf-25`) | **5.56** | **210.1** | 34.8 min |
+| Selective `[0,4,17,21]` (`smooth-donkey-26`) | 8.06 | 2,885.6 | 83.3 min |
+| All-layers MoE | 7.08 | 974.6 | 294.5 min |
+
+One well-chosen layer closes most of the gap to dense on every axis (`val_ppl` ~4.6x better than all-layers, wall-clock ~8.5x faster) — real support for the selective-layer direction over all-layers replacement. Adding the three second-tier candidates made things *worse*, not better — worse than `[0]` alone and worse than all-layers on `val_ppl`. This is a correction to §6.7's own framing: layers 4/17/21 were recommended based on *low seed-to-seed variance* in their `load_loss`, but their *average* `load_loss` was still moderate-to-poor (1.8–3.8, nowhere near layer 0's 0.21) — reliably mediocre is not the same as good, and diluting the one genuinely well-balanced layer with three consistently-so-so ones hurt more than it helped. Layer 0 alone remains the best MoE configuration found in this investigation.
+
+### 8.2 Bug: `centroid_refresh_steps` was measured in micro-batches, not steps
+
+Found by a sharp observation during live monitoring: a repeating loss-disruption pattern visible at 250-step intervals that didn't match the configured `centroid_refresh_steps=500` at all. Root cause: `DiffusionMoELayer`'s internal `_step` counter increments once per `forward()` call, but `Trainer.train_step()` calls `forward()` once per *micro-batch* — `grad_accum_steps` times per logged/optimizer step, not once. Every other `*_steps` config value (`checkpoint_steps`, `eval_steps`, `log_steps`) is measured in optimizer-step units; `centroid_refresh_steps` silently wasn't. With this project's `grad_accum_steps=2` default, **every run in this investigation had been refitting landmarks twice as often as configured — 8 times over a 2,441-step run, not 4.**
+
+Confirmed directly: the same crash-then-recover `load_loss`/`task_loss` signature already found at steps 500/1000/1500/2000 (§2.1) also appears identically at 250/750/1250/1750 in `graceful-universe-21` — exactly the halved-cadence prediction.
+
+Fixed by threading `grad_accum_steps` into `DiffusionMoELayer` (and the full `_build_moe_layer`/`DiffusionMoETransformer`/`build_model_from_config` chain), so the refresh check is `_step % (centroid_refresh_steps * grad_accum_steps) == 0` — robust to future changes to `grad_accum_steps`, rather than requiring it to be manually doubled by hand.
+
+### 8.3 The deeper finding: the model doesn't recover before the next refit hits
+
+Investigating the disruption further (prompted by the question of whether a single refit's damage is transient or lasting) surfaced something worse than §2's original characterization. Tracing `task_loss` across a *full* refit-to-refit window in `graceful-universe-21` (step 250 to step 750):
+
+```
+step 230 (pre-refit):  task_loss=6.92
+step 270 (post-refit): task_loss=9.62   <- spike
+step 490 (mid-window):  task_loss=7.84   <- best it gets, still worse than pre-refit
+step 750 (next refit):  task_loss=8.45   <- never recovered, then hit again
+```
+
+`task_loss` never returns to its pre-refit level anywhere in that 500-step window, and the *next* refit lands before it can close the remaining gap. §2.1's original claim ("`load_loss` recovers within ~10-15 steps") was real but incomplete: that described `load_loss`'s aggregate *magnitude* returning to a normal noisy range, not the model's actual specialization quality recovering — the two were conflated. The honest framing: the diffusion map assumes something close to a stable manifold to fit a geometric embedding of, but the thing being embedded (post-attention activations) is itself continuously reshaped by the same gradient descent process the routing depends on (`task_loss`'s gradient flows into the attention weights that produce those activations; only the routing losses are detached — see `methodology.md` §5.2). A periodic *hard* refit repeatedly asks the router to re-orient to wherever that target has drifted to, with experts caught mid-specialization each time. This has a direct parallel in the deep-clustering literature, where alternating between fitting a clustering and updating the representation it's fit to is a known source of instability.
+
+### 8.4 The sign-alignment fix helped only at the margin
+
+A candidate mitigation: diffusion-map eigenvectors are only defined up to sign, and a refit replaces the basis outright (fresh landmarks, fresh eigensolve) with no guaranteed relationship to the old basis's orientation — `ExpertCentroids` doesn't get remapped when this happens, so an arbitrary sign flip adds a second, gratuitous discontinuity on top of the real drift from §8.3. Fixed in `NystromDiffusionMap.fit()`: snapshot the old basis's embedding of the current batch before overwriting anything, then flip each new component's sign to agree with it (confirmed against real data: a natural refit reproducibly flips a component's sign without the fix, dot product `-0.0043` against the pre-refit embedding, and does not with it).
+
+Tested head-to-head on the best selective config (`layers_to_replace=[0]`, `seed=42`): `polar-leaf-25` (before) vs. `denim-darkness-27` (after).
+
+| | Before | After |
+|---|---|---|
+| `task_loss` | 5.56 | 5.57 |
+| `val_ppl` | 210.1 | 211.0 |
+| Wall-clock | 34.8 min | 34.8 min |
+| Peak `task_loss` in the step-250 disruption window | 7.60 | 7.15 |
+
+Essentially no change to the final outcome, though a small, real softening of the immediate disruption (peak task_loss 7.60 → 7.15). This is exactly what §8.3's framing predicts: sign-alignment removes a secondary source of discontinuity, but the dominant cause — the representation itself moving under the router — is untouched by it. Kept (it's a correct, cheap, structural fix, and it does measurably soften the immediate jolt even if it doesn't close the gap), but not a solution to the underlying problem on its own.
+
+### 8.5 The shared expert, made a uniform toggle
+
+Originally added only to `DiffusionMoELayer`, unconditionally on (§3). Made a `use_shared_expert` config toggle (`routing.use_shared_expert`, default `true`) threaded uniformly across all four router variants (`diffusion`/`switch`/`cosine`/`random`), so it can be compared on/off consistently rather than assumed to help everywhere, and so the comparison in §8.6 holds it constant rather than present on only one side.
+
+### 8.6 A structurally different router: Switch Transformer's learned linear gate
+
+§8.3's finding reframes the problem: the issue isn't primarily the diffusion router's refit *mechanics* (§8.2/§8.4 both fixed real bugs there with only marginal effect) — it's that periodic hard refitting of a geometric embedding is fighting a representation that's continuously moving under gradient descent. `SwitchMoELayer` — already implemented in this codebase as a baseline (`router: "switch"`), a single learned linear projection to expert logits, trained continuously by ordinary backprop, no diffusion map, no periodic refit, no discontinuity by construction — sidesteps this entire class of problem rather than mitigating it. Testing it at the same config as the best diffusion result (`layers_to_replace=[0]`, `use_shared_expert=true`, `seed=42`) directly asks whether the diffusion router's problems are specific to periodic hard refitting, or whether sparse routing itself is the harder part at this scale. *[Run in progress at time of writing; results to follow.]*
+
+---
+
+## 9. Code Changes Summary
 
 | File | Change |
 |---|---|
-| `geometry/nystrom.py` | Guarded the `d_alpha_new` division against exact-zero underflow; added live `eps_`/landmark-spectrum refresh in `transform()` (new `_refresh_eps` param, default on); extracted `_fit_landmark_spectrum` shared between `fit()` and the refresh path |
+| `geometry/nystrom.py` | Guarded the `d_alpha_new` division against exact-zero underflow; added live `eps_`/landmark-spectrum refresh in `transform()` (new `_refresh_eps` param, default on); extracted `_fit_landmark_spectrum` shared between `fit()` and the refresh path; `fit()` now sign-aligns the freshly-fit eigenbasis to agree with the previous one's embedding of the same batch (§8.4) |
 | `geometry/eigensolver.py` | `diffusion_eigenvectors` gained a `random_state` param, seeding ARPACK's starting vector — needed once the eigensolve could rerun mid-training, not just once per landmark set |
-| `models/moe_layer.py` | Added mandatory `shared_expert` (unconditional, outside the router); `_compute_diffusion_coords` now also refits when `ndm.landmarks_ is None` (checkpoint-resume fix), not only on the step-count schedule |
-| `models/moe_model.py` | Fixed `token_embedding` init (`std=0.02`, was `nn.Embedding` default `std=1.0`); added depth-aware `1/sqrt(2×n_layers)` scaling to every `out_proj`/`down_proj` weight after construction |
+| `models/moe_layer.py` | Added `shared_expert` (outside the router; §3); `_compute_diffusion_coords` now also refits when `ndm.landmarks_ is None` (checkpoint-resume fix), not only on the step-count schedule; refresh cadence now accounts for `grad_accum_steps` (§8.2); `use_shared_expert`/`grad_accum_steps` constructor params |
+| `models/switch_moe_layer.py`, `models/cosine_moe_layer.py`, `models/random_moe_layer.py` | Added the same `use_shared_expert` toggle (§8.5) — the shared expert is no longer `DiffusionMoELayer`-only |
+| `models/moe_model.py` | Fixed `token_embedding` init (`std=0.02`, was `nn.Embedding` default `std=1.0`); added depth-aware `1/sqrt(2×n_layers)` scaling to every `out_proj`/`down_proj` weight after construction; threads `grad_accum_steps`/`use_shared_expert` through `_build_moe_layer` |
+| `models/model_factory.py` | Reads `training.grad_accum_steps` and `routing.use_shared_expert` from config |
 | `training/trainer.py` | Added non-finite-loss guard in `train_step` (raises `FloatingPointError` before `backward()`/`optimizer.step()` instead of silently training on NaN/Inf); added `_prune_old_checkpoints` (`keep_last_n_checkpoints`, default 2) |
 | `data/dataloader.py` | Fixed `local_data_files` reaching the real Hydra-config-driven training path — a `ConfigAttributeError` several frames deep (`omegaconf.ListConfig` vs. plain `list`), not an obvious error at the call site |
 | `scripts/expert_attribution.py` | Added Hydra-style CLI override support (`parse_known_args`), so it can point at the real data config a checkpoint was trained against instead of always falling back to `base_config.yaml`'s defaults |
 | `scripts/train.py` | `cfg.seed` now actually applied (`torch.manual_seed`/`np.random.seed`/`random.seed`/`torch.cuda.manual_seed_all`) before model construction — previously a no-op |
-| `configs/base_config.yaml` | `routing.mu_load`: `0.01` → `2.0` (measured, §6.2); `training.keep_last_n_checkpoints: 2` (new) |
+| `configs/base_config.yaml` | `routing.mu_load`: `0.01` → `2.0` (measured, §6.2); `training.keep_last_n_checkpoints: 2` (new); `routing.use_shared_expert: true` (new, §8.5) |
 
-All changes are covered by tests reproducing the specific failure before confirming the fix, not just testing the fix in isolation — e.g. a mixed-batch outlier reproducing the exact NaN-underflow condition; a cross-object checkpoint resume at a step deliberately off the refit schedule, confirmed to crash on the pre-fix code (verified by temporarily reverting the fix) and pass after; a monkeypatched zero-contribution routed path confirming the shared expert's contribution is structurally unconditional; a real disk-bounded checkpoint-pruning scenario; the random-label cross-entropy check confirming init-time loss lands near the true random baseline (confirmed to fail — 61.5 vs. an expected <13.8 — on the pre-fix code); and a same-seed-reproduces/different-seed-diverges check on model initialization. Full suite: 376 tests passing at last check.
+All changes are covered by tests reproducing the specific failure before confirming the fix, not just testing the fix in isolation — e.g. a mixed-batch outlier reproducing the exact NaN-underflow condition; a cross-object checkpoint resume at a step deliberately off the refit schedule, confirmed to crash on the pre-fix code (verified by temporarily reverting the fix) and pass after; a monkeypatched zero-contribution routed path confirming the shared expert's contribution is structurally unconditional; a real disk-bounded checkpoint-pruning scenario; the random-label cross-entropy check confirming init-time loss lands near the true random baseline (confirmed to fail — 61.5 vs. an expected <13.8 — on the pre-fix code); a same-seed-reproduces/different-seed-diverges check on model initialization; a `centroid_refresh_steps`/`grad_accum_steps` interaction check confirming the correct (not halved) refit cadence; and a sign-alignment check confirming a real refit reproducibly flips a component's sign without the fix and does not with it. Full suite: 385 tests passing at last check.
 
 ---
 
@@ -253,4 +318,4 @@ All changes are covered by tests reproducing the specific failure before confirm
 - Does the depth-progression / sequence-start routing pattern (§6.6) persist, sharpen into content-sensitivity, or dissolve entirely at a later training step and a larger token budget? **Partially answered for layer 0 by §6.7**: by the final checkpoint it had moved past pure position into a real content-correlated split (digit vs. word tokens on one seed), though the specific feature wasn't identical on the other seed. Layer 6 specifically (the depth-progression layer) wasn't re-checked at the final checkpoint — still open.
 - Should `nu_sep` (currently unchanged at 0.05) be measured the same way `mu_load` was (§6.2)? `sep_loss` showed real instability of its own (swings from -3.5 to -10.6 within ~120 steps in the collapsed run) that was not directly investigated — it may be a downstream symptom of the same collapse dynamic, or a separate miscalibration.
 - The self-tuning (per-point adaptive) bandwidth design discussed but not implemented (the "Option 2" alternative to §2.2's global live-refresh) remains a candidate if staleness-driven instability recurs even with the current fix.
-- `NystromDiffusionMap`'s own k-means/eigensolve randomness still has a hardcoded `random_state=42`, independent of `cfg.seed` (§8) — the seed-repeat check in §6.5 varied model init and data-adjacent RNG state, but not this. Worth wiring through too if the seed-sensitivity finding in §6.5 needs isolating further (is it driven by init, by the diffusion-map's own landmark selection, or both).
+- `NystromDiffusionMap`'s own k-means/eigensolve randomness still has a hardcoded `random_state=42`, independent of `cfg.seed` (§9) — the seed-repeat check in §6.5 varied model init and data-adjacent RNG state, but not this. Worth wiring through too if the seed-sensitivity finding in §6.5 needs isolating further (is it driven by init, by the diffusion-map's own landmark selection, or both).
