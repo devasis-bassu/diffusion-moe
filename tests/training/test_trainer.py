@@ -313,9 +313,54 @@ def test_uses_wandb_when_api_key_set_and_wandb_available(tmp_path, monkeypatch):
     t = _make_trainer(tmp_path, layers_to_replace=[])
     assert t.use_wandb
     assert len(calls["init"]) == 1
+    # Previously omitted entirely -- confirming what a run actually used
+    # required SSHing into the instance and reading its log file by hand.
+    assert calls["init"][0]["config"] == t.config
 
     t._log({"loss": 1.0}, 0)
     assert calls["log"] == [({"loss": 1.0}, 0)]
+
+
+def test_wandb_init_flattens_a_real_omegaconf_config(tmp_path, monkeypatch):
+    """The plain-dict case above doesn't exercise the real path: scripts/
+    train.py passes a genuine Hydra DictConfig, not a plain dict.
+    OmegaConf.to_container must flatten it into a plain, JSON-serializable
+    dict, not pass the DictConfig object through as-is."""
+    from omegaconf import OmegaConf
+
+    calls = {"init": []}
+
+    class FakeWandb:
+        @staticmethod
+        def init(**kwargs):
+            calls["init"].append(kwargs)
+
+        @staticmethod
+        def log(metrics, step=None):
+            pass
+
+    monkeypatch.setattr(trainer_module, "wandb", FakeWandb)
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+
+    model = _make_model(layers_to_replace=[])
+    optimizer = build_optimizer(model, lr=1e-3, weight_decay=0.0)
+    scheduler = build_scheduler(optimizer, warmup_steps=0, total_steps=100)
+    train_loader = DataLoader(_TinyLMDataset(n_examples=16, seed=0), batch_size=4)
+    val_loader = DataLoader(_TinyLMDataset(n_examples=8, seed=1), batch_size=4)
+    cfg = OmegaConf.create(
+        {
+            "training": {"grad_accum_steps": 1, "grad_clip": 1.0, "precision": "fp32"},
+            "routing": {"mu_load": 0.01, "nu_sep": 0.05},
+            "wandb": {"project": "test-project"},
+        }
+    )
+
+    Trainer(model, optimizer, scheduler, train_loader, val_loader, cfg, device="cpu",
+            checkpoint_dir=str(tmp_path / "checkpoints"))
+
+    logged_config = calls["init"][0]["config"]
+    assert isinstance(logged_config, dict)  # not a DictConfig
+    assert logged_config["routing"]["mu_load"] == 0.01
 
 
 def test_does_not_use_wandb_without_api_key_even_if_wandb_available(tmp_path, monkeypatch):

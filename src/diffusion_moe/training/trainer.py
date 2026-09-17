@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import torch
+from omegaconf import OmegaConf
 from torch.nn.parallel import DistributedDataParallel
 
 from diffusion_moe.data.dataset import IGNORE_INDEX
@@ -125,7 +126,20 @@ class Trainer:
             is_main_process() and bool(os.environ.get("WANDB_API_KEY")) and wandb is not None
         )
         if self.use_wandb:
-            wandb.init(project=_get(wandb_cfg, "project", "diffusion-moe"))
+            # Previously omitted entirely: wandb.init() was never given
+            # `config=`, so no run's actual hyperparameters (routing.top_k,
+            # model.router, use_shared_expert, ...) were ever recorded in
+            # wandb -- confirming what a given run actually used required
+            # SSHing into the instance and reading its (often still-buffered,
+            # see Trainer's own stdout-buffering notes elsewhere) log file
+            # by hand. OmegaConf.to_container flattens a real Hydra
+            # DictConfig into a plain, JSON-serializable dict; falls back to
+            # the config object as-is for the plain-dict configs the test
+            # suite uses, which OmegaConf.is_config correctly rejects.
+            wandb_config = (
+                OmegaConf.to_container(config, resolve=True) if OmegaConf.is_config(config) else config
+            )
+            wandb.init(project=_get(wandb_cfg, "project", "diffusion-moe"), config=wandb_config)
 
     @property
     def raw_model(self) -> torch.nn.Module:
