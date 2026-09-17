@@ -58,6 +58,25 @@ class NystromDiffusionMap:
         n = Z.shape[0]
         n_landmarks = min(self.n_landmarks, n)
 
+        # Diffusion-map eigenvectors are only defined up to sign (Nystrom's
+        # own docstring already notes eigenvalues are non-negative; signs
+        # are the other half of that ambiguity). A refit doesn't perturb the
+        # old basis, it replaces it outright -- fresh landmarks (a new
+        # k-means draw) and a fresh eigensolve, with no guaranteed
+        # relationship to the old basis's orientation. ExpertCentroids
+        # (models/moe_layer.py) is an ordinary nn.Parameter trained by
+        # gradient descent against whatever basis was in effect -- it does
+        # NOT get remapped when this happens, so an arbitrary sign flip here
+        # silently scrambles routing relative to it. Confirmed empirically,
+        # not just in theory (phase2_training_report.md): load_loss crashes
+        # to ~0 immediately after every refit and takes ~10-15 steps to
+        # recover, with a correlated task_loss spike -- the router
+        # re-learning alignment it had already learned once, every single
+        # refit. Snapshot the OLD basis's embedding of this same batch
+        # before overwriting anything, so the new basis can be aligned to it
+        # below -- None on the very first fit (nothing to align against yet).
+        psi_old = self.transform(Z, _refresh_eps=False) if self.landmarks_ is not None else None
+
         kmeans = KMeans(
             n_clusters=n_landmarks,
             init="k-means++",
@@ -70,7 +89,30 @@ class NystromDiffusionMap:
         eps = self.eps if self.eps is not None else bandwidth_median_heuristic(self.landmarks_)
         self._fit_landmark_spectrum(eps)
 
+        if psi_old is not None:
+            psi_new = self.transform(Z, _refresh_eps=False)
+            self._align_sign_to(psi_old, psi_new)
+
         return self
+
+    def _align_sign_to(self, psi_old: np.ndarray, psi_new: np.ndarray) -> None:
+        """Flips each component's sign in the just-fit eigenbasis to maximize
+        agreement with psi_old (the previous basis's embedding of the same
+        batch), component by component. Landmarks themselves changed (a
+        fresh k-means draw), so there's no per-point correspondence to align
+        directly -- comparing both bases' embeddings of the same batch Z is
+        the common reference that makes "agreement" measurable at all.
+
+        Sign-only: this does not correct rotation within a near-degenerate
+        eigenspace (two eigenvalues close enough that their eigenvectors can
+        mix, not just flip) -- a real but smaller-scope gap than the sign
+        ambiguity this does fix, left as a follow-up if this alone doesn't
+        meaningfully reduce the refit disruption.
+        """
+        for k in range(psi_old.shape[1]):
+            if np.dot(psi_old[:, k], psi_new[:, k]) < 0:
+                self.eigenvectors_[:, k] *= -1
+                self.psi_landmarks_[:, k] *= -1
 
     def _fit_landmark_spectrum(self, eps: float) -> None:
         """(Re)derives everything that depends on the kernel bandwidth, given

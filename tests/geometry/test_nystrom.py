@@ -96,6 +96,70 @@ def test_eps_override_same_seed_reuses_same_landmarks():
     np.testing.assert_array_equal(ndm_a.landmarks_, ndm_b.landmarks_)
 
 
+def test_align_sign_to_flips_eigenvectors_and_psi_landmarks_on_disagreement():
+    """Direct, deterministic test of the core alignment logic, decoupled
+    from the noisy randomness of a real k-means/eigensolve pipeline: given
+    a reference embedding and a "new" one that disagrees in sign on some
+    components and agrees on others, only the disagreeing components'
+    eigenvectors_/psi_landmarks_ should flip."""
+    Z = _make_data(n=100)
+    ndm = NystromDiffusionMap(n_landmarks=16, n_components=4, random_state=0)
+    ndm.fit(Z)
+
+    eigenvectors_before = ndm.eigenvectors_.copy()
+    psi_landmarks_before = ndm.psi_landmarks_.copy()
+
+    n_points = 20
+    psi_old = np.random.RandomState(1).randn(n_points, 4)
+    psi_new = psi_old.copy()
+    psi_new[:, 1] *= -1  # disagreement on component 1 only
+    psi_new[:, 3] *= -1  # and component 3
+
+    ndm._align_sign_to(psi_old, psi_new)
+
+    for k in (0, 2):  # agreeing components: untouched
+        assert np.allclose(ndm.eigenvectors_[:, k], eigenvectors_before[:, k])
+        assert np.allclose(ndm.psi_landmarks_[:, k], psi_landmarks_before[:, k])
+    for k in (1, 3):  # disagreeing components: flipped
+        assert np.allclose(ndm.eigenvectors_[:, k], -eigenvectors_before[:, k])
+        assert np.allclose(ndm.psi_landmarks_[:, k], -psi_landmarks_before[:, k])
+
+
+def test_first_fit_does_not_attempt_alignment():
+    """landmarks_ starts None -- there's no previous basis to align against,
+    and _align_sign_to must not be called at all on the very first fit."""
+    Z = _make_data(n=100)
+    ndm = NystromDiffusionMap(n_landmarks=16, n_components=4, random_state=0)
+
+    calls = []
+    ndm._align_sign_to = lambda *a, **kw: calls.append(1)
+    ndm.fit(Z)
+
+    assert calls == []
+
+
+def test_refit_aligns_new_basis_to_agree_with_the_old_ones_embedding():
+    """The actual invariant the fix exists for: after a refit on evolved
+    (but related) data, the new basis's embedding of a fixed reference batch
+    should correlate *positively* with what the old basis said about the
+    same batch, component by component -- not land on an arbitrary sign
+    per refit, which is what silently scrambles routing relative to
+    ExpertCentroids (a plain nn.Parameter that doesn't get remapped)."""
+    Z1 = _make_data(n=150, seed=0)
+    reference = _make_data(n=30, seed=99)
+
+    ndm = NystromDiffusionMap(n_landmarks=24, n_components=5, random_state=0)
+    ndm.fit(Z1)
+    psi_before = ndm.transform(reference, _refresh_eps=False)
+
+    Z2 = Z1 + np.random.RandomState(2).randn(*Z1.shape) * 0.5  # evolved data
+    ndm.fit(Z2)
+    psi_after = ndm.transform(reference, _refresh_eps=False)
+
+    for k in range(psi_before.shape[1]):
+        assert np.dot(psi_before[:, k], psi_after[:, k]) >= 0
+
+
 def test_eps_refreshes_across_transform_calls_when_no_override():
     """Option 1 fix for the staleness bug: eps_ (the kernel bandwidth) should
     track the *current* batch's actual distance to the frozen landmarks,
