@@ -89,7 +89,7 @@ def test_baseline_parity_random_router_top_k_equals_n_experts():
 
     moe = RandomMoELayer(
         d_model=d_model, num_heads=8, max_seq_len=32, n_experts=n_experts, top_k=n_experts,
-        ffn_dim=ffn_dim,
+        ffn_dim=ffn_dim, use_shared_expert=False,  # isolate the routed-experts identity being tested
     )
     dense = TransformerBlock(d_model=d_model, num_heads=8, max_seq_len=32, ffn_dim=ffn_dim)
 

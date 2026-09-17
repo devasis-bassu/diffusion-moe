@@ -22,6 +22,18 @@ def _inputs():
     return x, positions
 
 
+def test_shared_expert_toggleable_default_on():
+    """use_shared_expert is a uniform toggle across all four router variants
+    (default True) -- see DiffusionMoELayer's docstring for the motivation."""
+    layer_on = _layer()
+    assert layer_on.shared_expert is not None
+
+    layer_off = _layer(use_shared_expert=False)
+    assert layer_off.shared_expert is None
+    out, _ = layer_off(*_inputs())  # must not raise with shared_expert=None
+    assert out.shape == (BATCH, SEQ_LEN, D_MODEL)
+
+
 def test_output_and_aux_shapes():
     layer = _layer()
     x, positions = _inputs()

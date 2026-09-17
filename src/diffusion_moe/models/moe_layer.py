@@ -70,6 +70,7 @@ class DiffusionMoELayer(nn.Module):
         noise_std: float = 0.0,
         cosine: bool = False,
         grad_accum_steps: int = 1,
+        use_shared_expert: bool = True,
     ) -> None:
         super().__init__()
         ffn_dim = ffn_dim if ffn_dim is not None else 4 * d_model
@@ -126,8 +127,15 @@ class DiffusionMoELayer(nn.Module):
         )
         # Same width/overlap_factor as a routed expert -- see the class
         # docstring for why this exists and why "shared" means unconditional
-        # application, not a different architecture.
-        self.shared_expert = ExpertFFN(d_model, ffn_dim, n_experts, overlap_factor=overlap_factor)
+        # application, not a different architecture. Toggleable (was
+        # unconditional) so it can be compared on/off across every router
+        # variant uniformly -- see use_shared_expert in each of the other
+        # three layer classes.
+        self.shared_expert = (
+            ExpertFFN(d_model, ffn_dim, n_experts, overlap_factor=overlap_factor)
+            if use_shared_expert
+            else None
+        )
 
         self.register_buffer("_step", torch.tensor(0, dtype=torch.long))
 
@@ -225,10 +233,12 @@ class DiffusionMoELayer(nn.Module):
 
         ffn_input = self.ffn_norm(x)
         expert_out = self._dispatch_and_aggregate(ffn_input, gate_values, expert_indices)
-        # Unconditional: every token, every step, no gate value -- entirely
-        # outside the router's influence (see class docstring).
-        shared_out = self.shared_expert(ffn_input)
-        output = x + expert_out + shared_out
+        # When present: unconditional, every token, every step, no gate
+        # value -- entirely outside the router's influence (see class
+        # docstring). self.shared_expert is None when use_shared_expert=False.
+        output = x + expert_out
+        if self.shared_expert is not None:
+            output = output + self.shared_expert(ffn_input)
 
         aux = {
             "router_logits": router_logits,

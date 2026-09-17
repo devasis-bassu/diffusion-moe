@@ -40,6 +40,7 @@ class CosineMoELayer(nn.Module):
         rope_base: int = 10000,
         norm_eps: float = 1e-5,
         dropout: float = 0.0,
+        use_shared_expert: bool = True,
     ) -> None:
         super().__init__()
         ffn_dim = ffn_dim if ffn_dim is not None else 4 * d_model
@@ -58,6 +59,14 @@ class CosineMoELayer(nn.Module):
                 ExpertFFN(d_model, ffn_dim, n_experts, overlap_factor=overlap_factor)
                 for _ in range(n_experts)
             ]
+        )
+        # Same width/overlap_factor as a routed expert, applied unconditionally
+        # every token/step, no gate value -- see DiffusionMoELayer's docstring
+        # for the full motivation. None when use_shared_expert=False.
+        self.shared_expert = (
+            ExpertFFN(d_model, ffn_dim, n_experts, overlap_factor=overlap_factor)
+            if use_shared_expert
+            else None
         )
 
     def forward(
@@ -79,6 +88,8 @@ class CosineMoELayer(nn.Module):
         ffn_input = self.ffn_norm(x)
         expert_out = dispatch_and_aggregate(ffn_input, gate_values, expert_indices, self.experts)
         output = x + expert_out
+        if self.shared_expert is not None:
+            output = output + self.shared_expert(ffn_input)
 
         aux = {
             "router_logits": router_logits,

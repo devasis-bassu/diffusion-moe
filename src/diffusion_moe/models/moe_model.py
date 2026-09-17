@@ -45,6 +45,7 @@ def _build_moe_layer(
     noise_std: float = 0.0,
     cosine: bool = False,
     grad_accum_steps: int = 1,
+    use_shared_expert: bool = True,
 ) -> nn.Module:
     """Builds one MoE layer of the requested router type. Each variant takes
     only the subset of these hyperparameters that are meaningful for it (e.g.
@@ -70,6 +71,7 @@ def _build_moe_layer(
         rope_base=rope_base,
         norm_eps=norm_eps,
         dropout=dropout,
+        use_shared_expert=use_shared_expert,
     )
 
     if router == "diffusion":
@@ -119,6 +121,7 @@ class DiffusionMoETransformer(nn.Module):
         cosine_layers: list[int] | None = None,
         tie_embeddings: bool = True,
         grad_accum_steps: int = 1,
+        use_shared_expert: bool = True,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -179,6 +182,7 @@ class DiffusionMoETransformer(nn.Module):
                         noise_std=noise_std,
                         cosine=layer_idx in cosine_set,
                         grad_accum_steps=grad_accum_steps,
+                        use_shared_expert=use_shared_expert,
                     )
                 )
             else:

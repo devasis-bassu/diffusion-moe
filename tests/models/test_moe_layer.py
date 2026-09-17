@@ -134,6 +134,22 @@ def test_shared_expert_contributes_even_when_routing_contributes_nothing():
     assert not torch.allclose(out, x + z)
 
 
+def test_shared_expert_is_toggleable():
+    """use_shared_expert was previously unconditional -- now a toggle,
+    consistent with the other three router variants (switch/cosine/random),
+    so it can be compared on/off uniformly rather than assumed to help
+    everywhere."""
+    layer_on = _make_layer(use_shared_expert=True)
+    assert layer_on.shared_expert is not None
+
+    layer_off = _make_layer(use_shared_expert=False)
+    assert layer_off.shared_expert is None
+
+    x, positions = _inputs()
+    out_off, _ = layer_off(x, positions)  # must not raise with shared_expert=None
+    assert out_off.shape == (BATCH, SEQ_LEN, D_MODEL)
+
+
 def test_refresh_schedule_triggers_refit_every_n_steps():
     """centroid_refresh_steps=5: steps 0, 5, 10, ... refit (fit_transform);
     others reuse the frozen landmarks via transform(). We can't observe this

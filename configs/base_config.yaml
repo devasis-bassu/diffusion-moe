@@ -24,6 +24,15 @@ routing:
   n_landmarks: 128
   diffusion_t: 3
   alpha: 1.0
+  # Every token/step, unconditionally, no gate value -- entirely outside
+  # whichever router is in effect. Same width/overlap_factor as a routed
+  # expert; adds real active compute (top_k+1 experts fire, not top_k), not
+  # a reallocation of existing capacity. Originally added only to
+  # DiffusionMoELayer (motivated by near-universal partial load imbalance
+  # once every layer was routed -- phase2_training_report.md §3); made a
+  # uniform, toggleable option across all four router variants so it can be
+  # compared on/off consistently, not just assumed to help everywhere.
+  use_shared_expert: true
   # Measured directly, not guessed: on a freshly (correctly) initialized
   # model, task_loss's raw gradient pull on the shared ExpertCentroids
   # parameter is only ~1.86x load_loss's raw pull -- a fair fight. The old
