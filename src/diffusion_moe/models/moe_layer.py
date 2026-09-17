@@ -69,6 +69,7 @@ class DiffusionMoELayer(nn.Module):
         centroid_refresh_steps: int = 500,
         noise_std: float = 0.0,
         cosine: bool = False,
+        grad_accum_steps: int = 1,
     ) -> None:
         super().__init__()
         ffn_dim = ffn_dim if ffn_dim is not None else 4 * d_model
@@ -77,6 +78,17 @@ class DiffusionMoELayer(nn.Module):
         self.top_k = top_k
         self.n_components = n_components
         self.centroid_refresh_steps = centroid_refresh_steps
+        # _step (below) increments once per forward() call, but Trainer
+        # calls forward() once per MICRO-batch -- grad_accum_steps times per
+        # logged/optimizer step, not once. Every other *_steps config value
+        # (checkpoint_steps, eval_steps, log_steps) is measured in optimizer-
+        # step units; without this, centroid_refresh_steps silently wasn't --
+        # with the project's grad_accum_steps=2 default, refits were firing
+        # every 250 logged steps, not the configured 500, for this entire
+        # investigation (found by a sharp catch: a repeating loss-disruption
+        # pattern visible at 250-step intervals that didn't match any
+        # configured cadence). See _compute_diffusion_coords.
+        self.grad_accum_steps = grad_accum_steps
         # Whether to fit/transform the diffusion map on L2-normalized (cosine
         # kernel) rather than raw activations. Off by default: the full
         # 32-layer multiscale sweep (phase1_findings_report.md §2.4) found
@@ -122,8 +134,10 @@ class DiffusionMoELayer(nn.Module):
     def _compute_diffusion_coords(self, z: torch.Tensor) -> torch.Tensor:
         """z: (batch, seq, d_model) post-attention activations. Returns
         Psi_t: (batch, seq, n_components). Refits the NystromDiffusionMap
-        (landmarks + eigensystem) every centroid_refresh_steps calls; reuses
-        the frozen landmarks via Nystrom extension in between. sklearn-backed,
+        (landmarks + eigensystem) every centroid_refresh_steps *logged/
+        optimizer* steps (centroid_refresh_steps * grad_accum_steps forward
+        calls, since forward() runs once per micro-batch); reuses the frozen
+        landmarks via Nystrom extension in between. sklearn-backed,
         so this always runs on detached CPU float64 arrays, regardless of the
         model's device/dtype.
         """
@@ -154,7 +168,7 @@ class DiffusionMoELayer(nn.Module):
         # model (layers_to_replace=[]), never touching this path at all.
         should_refresh = (
             self.ndm.landmarks_ is None
-            or int(self._step.item()) % self.centroid_refresh_steps == 0
+            or int(self._step.item()) % (self.centroid_refresh_steps * self.grad_accum_steps) == 0
         )
         if should_refresh:
             psi_flat = self.ndm.fit_transform(z_flat)

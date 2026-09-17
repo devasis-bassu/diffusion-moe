@@ -44,6 +44,7 @@ def _build_moe_layer(
     centroid_refresh_steps: int,
     noise_std: float = 0.0,
     cosine: bool = False,
+    grad_accum_steps: int = 1,
 ) -> nn.Module:
     """Builds one MoE layer of the requested router type. Each variant takes
     only the subset of these hyperparameters that are meaningful for it (e.g.
@@ -82,6 +83,7 @@ def _build_moe_layer(
             centroid_refresh_steps=centroid_refresh_steps,
             noise_std=noise_std,
             cosine=cosine,
+            grad_accum_steps=grad_accum_steps,
         )
     if router == "cosine":
         return CosineMoELayer(**common, tau=tau)
@@ -116,6 +118,7 @@ class DiffusionMoETransformer(nn.Module):
         noise_std: float = 0.0,
         cosine_layers: list[int] | None = None,
         tie_embeddings: bool = True,
+        grad_accum_steps: int = 1,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -175,6 +178,7 @@ class DiffusionMoETransformer(nn.Module):
                         centroid_refresh_steps=centroid_refresh_steps,
                         noise_std=noise_std,
                         cosine=layer_idx in cosine_set,
+                        grad_accum_steps=grad_accum_steps,
                     )
                 )
             else:

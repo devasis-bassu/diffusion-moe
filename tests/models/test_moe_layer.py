@@ -158,6 +158,52 @@ def test_refresh_schedule_triggers_refit_every_n_steps():
     assert layer.ndm.landmarks_.shape == landmarks_after_refit.shape
 
 
+def test_refresh_schedule_accounts_for_grad_accum_steps():
+    """Real bug: _step increments once per forward() call, but Trainer calls
+    forward() once per MICRO-batch -- grad_accum_steps times per logged/
+    optimizer step, not once. Every other *_steps config value is measured
+    in optimizer-step units; without accounting for this, centroid_
+    refresh_steps silently wasn't -- refits fired at half the configured
+    interval whenever grad_accum_steps > 1 (found via a real training run:
+    a repeating loss-disruption pattern at 250-step intervals that didn't
+    match the configured centroid_refresh_steps=500 at all).
+    centroid_refresh_steps=3, grad_accum_steps=2 -> refit only every 6 calls
+    (steps 0 and 6), not every 3."""
+    layer = _make_layer(centroid_refresh_steps=3, grad_accum_steps=2)
+    x, positions = _inputs()
+    layer.train()
+
+    layer(x, positions)  # call 0 -> refit (landmarks_ was None)
+    landmarks_after_refit = layer.ndm.landmarks_.copy()
+
+    for _ in range(5):  # calls 1-5: must NOT refit (6 calls needed, not 3)
+        layer(x, positions)
+        assert (layer.ndm.landmarks_ == landmarks_after_refit).all()
+
+    layer(x, positions)  # call 6 -> refit again
+    assert layer.ndm.landmarks_.shape == landmarks_after_refit.shape
+
+
+def test_refresh_schedule_grad_accum_steps_defaults_to_1_unchanged_behavior():
+    """Regression guard: the default (grad_accum_steps=1) must reproduce the
+    original every-centroid_refresh_steps-calls behavior exactly -- this
+    fix must not change anything for the common (no accumulation) case."""
+    layer = _make_layer(centroid_refresh_steps=3)
+    assert layer.grad_accum_steps == 1
+    x, positions = _inputs()
+    layer.train()
+
+    layer(x, positions)  # step 0 -> refit
+    landmarks_after_refit = layer.ndm.landmarks_.copy()
+
+    layer(x, positions)  # step 1 -> no refit
+    assert (layer.ndm.landmarks_ == landmarks_after_refit).all()
+    layer(x, positions)  # step 2 -> no refit
+    assert (layer.ndm.landmarks_ == landmarks_after_refit).all()
+    layer(x, positions)  # step 3 -> refit again
+    assert layer.ndm.landmarks_.shape == landmarks_after_refit.shape
+
+
 def test_dispatch_and_aggregate_matches_naive_per_token_reference():
     layer = _make_layer(d_model=8, num_heads=2, n_components=3, n_landmarks=10)
     torch.manual_seed(1)

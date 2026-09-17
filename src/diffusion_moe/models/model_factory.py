@@ -30,4 +30,5 @@ def build_model_from_config(cfg: Any) -> DiffusionMoETransformer:
         layers_to_replace=cfg.get("layers_to_replace", None),
         noise_std=cfg.routing.get("noise_std", 0.0),
         cosine_layers=cfg.get("cosine_layers", None),
+        grad_accum_steps=cfg.training.grad_accum_steps,
     )
