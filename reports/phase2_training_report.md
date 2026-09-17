@@ -174,7 +174,46 @@ Two things confirmed here. First, §6.4's dense-beats-MoE result is not a fluke 
 
 ### 6.6 What token-level routing actually looks like (early-training snapshot)
 
-`scripts/expert_attribution.py` (extended this phase with Hydra CLI override support, so it can point at whatever data config a checkpoint was actually trained against — see `methodology.md` §6) was run against `hardy-lake-19`'s step-300 checkpoint. Filtering out padding (a first pass mistakenly included it — 479 of 492 positions in the sampled sequence were padding, trivially uniform) revealed real, reproducible structure, but **mostly positional, not semantic**, at this early stage: layer 0 routes only the first 1–4 tokens of every sequence to one expert (sequence-start detection) and everything else to another, regardless of topic; layer 6 shows a clean depth-progression through three experts as a sequence gets longer, independent of content; layer 20 was fully collapsed (one expert, ~99% of all real tokens across 5 sampled sequences). One layer (7) showed a plausible content-correlated split — a block of numeric/statistical text routing differently than surrounding narrative prose — but with one sequence and no position control, this could not be distinguished from coincidence. Worth repeating against a later, better-trained checkpoint (§7).
+`scripts/expert_attribution.py` (extended this phase with Hydra CLI override support, so it can point at whatever data config a checkpoint was actually trained against — see `methodology.md` §6) was run against `hardy-lake-19`'s step-300 checkpoint. Filtering out padding (a first pass mistakenly included it — 479 of 492 positions in the sampled sequence were padding, trivially uniform) revealed real, reproducible structure, but **mostly positional, not semantic**, at this early stage: layer 0 routes only the first 1–4 tokens of every sequence to one expert (sequence-start detection) and everything else to another, regardless of topic; layer 6 shows a clean depth-progression through three experts as a sequence gets longer, independent of content; layer 20 was fully collapsed (one expert, ~99% of all real tokens across 5 sampled sequences). One layer (7) showed a plausible content-correlated split — a block of numeric/statistical text routing differently than surrounding narrative prose — but with one sequence and no position control, this could not be distinguished from coincidence.
+
+### 6.7 Which layers to select for a follow-up: a data-driven answer, this architecture's own
+
+§7's revised recommendation points toward a *selective* layer-replacement strategy rather than all-layers. Phase 1's oracle-ceiling layer indices (10/29/30 recoverable; 17/20/31 needing cosine) don't transfer — that was a 32-layer Mistral-7B model, this is a 24-layer from-scratch one. This section derives candidates from this architecture's own data instead, combining both completed MoE runs (§6.5).
+
+**Per-layer `load_loss`, averaged across each run's full trajectory (not just the final point), both seeds:**
+
+| Layer | seed=42 mean | seed=123 mean | Average | Seed-to-seed spread |
+|---|---|---|---|---|
+| **0** | 0.223 | 0.206 | **0.214** | **0.017** |
+| 1 | 0.901 | 1.328 | 1.114 | 0.427 |
+| 2 | 0.769 | 1.701 | 1.235 | 0.932 |
+| **4** | 1.792 | 1.890 | 1.841 | **0.098** |
+| **17** | 2.344 | 2.159 | 2.252 | **0.185** |
+| **21** | 3.909 | 3.743 | 3.826 | **0.167** |
+| 20 | 3.328 | 3.601 | 3.464 | 0.273 |
+| 22 | 4.182 | 3.194 | 3.688 | 0.988 |
+| 23 | 4.264 | 3.307 | 3.786 | 0.957 |
+| 3, 5, 9, 14, 19 | — | — | mid-range | **1.0–1.6 (most volatile)** |
+
+(Remaining 13 layers omitted for space; the full 24-row table is reproducible from the wandb API, see §6.5's query.) Two independent signals matter here, not one: a low *average* means a layer tends to stay balanced; a low *spread* means that's reliable rather than a coin flip. Layer 0 dominates on both. Layers 4, 17, and 21 are a clear second tier — moderate-to-high averages, but consistently so (low spread) in both seeds. Layers 3/5/9/14/19 have seed-to-seed spreads of 1.0–1.6 — even where their average looks tolerable, they swing unpredictably and are poor candidates regardless of mean.
+
+**Confirmed against the final checkpoints directly**, not just the training-average proxy — `expert_attribution.py`'s top-expert-share on both runs' `step_2400.pt`:
+
+| Layer | seed=42 top share | seed=123 top share |
+|---|---|---|
+| **0** | 63.9% | 58.0% |
+| 4 | 78.6% | **91.9% (collapsed)** |
+| 17 | **91.4% (collapsed)** | **97.3% (collapsed)** |
+| 20 | 64.2% | **97.9% (collapsed)** |
+| 21 | 69.2% | **97.3% (collapsed)** |
+
+Layer 0 is the only layer that stayed meaningfully balanced on *both* seeds at the final checkpoint — everything else that looked reasonable on seed=42 (4, 20, 21) collapsed hard on seed=123. This matches the training-average table's ranking exactly and is the strongest, most consistent signal in this investigation for which single layer to pick first.
+
+**What layer 0 actually learned, at the token level (padding filtered)**: on `graceful-universe-21`'s (seed=42) final checkpoint, layer 0 shows a clean, token-by-token split correlating with a real linguistic feature — numeric/digit tokens route to one expert, word tokens to another, consistently across all 5 sampled sequences (e.g. `2:5 3:5 @:5 .:5` vs. `the:1 city:1 population:1 was:1` in the same sequence). Layer 4 shows the same categorical split with the expert IDs swapped. The collapsed layers show either nothing (layer 17: ~everything to one expert, no structure at all) or a noisier, degraded version of the same digit/word signal (layers 20/21: mostly consistent, with real exceptions).
+
+**This does not fully reproduce on `cool-pyramid-24`'s (seed=123) final checkpoint**, and the way it fails to reproduce is itself informative: layer 0 stays balanced (confirming the robustness finding above), but the *specific* boundary it draws is different — mostly one expert throughout, with a second expert taking over specifically in the numeric-dense passage plus scattered periods/conjunctions, rather than seed=42's clean per-token digit/word alternation. **The honest reading**: layer 0 reliably learns *to specialize rather than collapse* — that part is robust across seeds, confirmed three independent ways here (training-average `load_loss`, its spread, and final-checkpoint top-share). *What* it specializes on is not a fixed, guaranteed feature — the router reliably finds *some* real distinction to exploit, not always the *same* one.
+
+**Recommendation for the next run**: `layers_to_replace=[0]` as the single best-evidenced candidate, with `[0, 4, 17, 21]` as a secondary option if testing more than one layer is worth the added complexity — those three are the next tier by both average and consistency, despite 4 and 21 each collapsing on one of the two seeds tested. The five volatile mid-range layers (3, 5, 9, 14, 19) should be avoided in either case; their unpredictability makes them poor building blocks for a configuration meant to be reliable.
 
 ---
 
@@ -211,7 +250,7 @@ All changes are covered by tests reproducing the specific failure before confirm
 
 ## Appendix: Open Questions Carried Forward
 
-- Does the depth-progression / sequence-start routing pattern (§6.6) persist, sharpen into content-sensitivity, or dissolve entirely at a later training step and a larger token budget?
+- Does the depth-progression / sequence-start routing pattern (§6.6) persist, sharpen into content-sensitivity, or dissolve entirely at a later training step and a larger token budget? **Partially answered for layer 0 by §6.7**: by the final checkpoint it had moved past pure position into a real content-correlated split (digit vs. word tokens on one seed), though the specific feature wasn't identical on the other seed. Layer 6 specifically (the depth-progression layer) wasn't re-checked at the final checkpoint — still open.
 - Should `nu_sep` (currently unchanged at 0.05) be measured the same way `mu_load` was (§6.2)? `sep_loss` showed real instability of its own (swings from -3.5 to -10.6 within ~120 steps in the collapsed run) that was not directly investigated — it may be a downstream symptom of the same collapse dynamic, or a separate miscalibration.
 - The self-tuning (per-point adaptive) bandwidth design discussed but not implemented (the "Option 2" alternative to §2.2's global live-refresh) remains a candidate if staleness-driven instability recurs even with the current fix.
 - `NystromDiffusionMap`'s own k-means/eigensolve randomness still has a hardcoded `random_state=42`, independent of `cfg.seed` (§8) — the seed-repeat check in §6.5 varied model init and data-adjacent RNG state, but not this. Worth wiring through too if the seed-sensitivity finding in §6.5 needs isolating further (is it driven by init, by the diffusion-map's own landmark selection, or both).
